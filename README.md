@@ -30,7 +30,7 @@ A new **H3 Upscaler** tab runs MiniMax H3's phase 2 on a video that already exis
 | Control | Default | Effect |
 |---|---|---|
 | **Video to upscale** | | The source video (compact preview). The panel next to it shows the source size, the output size, the number of frames processed and the number of sliding windows. |
-| **Upscale Factor** | x2 | x1.5, x2, x2.5 or x3, applied to width and height (rounded to multiples of 32). The output is limited to **4096 pixels** on its longest side: beyond that, the factor is reduced and the panel shows the effective factor. |
+| **Upscale Factor** | x2 | **x1 (refiner)**, x1.5, x2, x2.5 or x3. With x1, the output keeps the source size and phase 2 only refines the video (the latent upscaler is skipped). Other factors are applied to width and height (rounded to multiples of 32). The output is limited to **4096 pixels** on its longest side: beyond that, the factor is reduced and the panel shows the effective factor. |
 | **MiniMax H3 Model (FL2VA or Ref2VA)** | FL2VA Pruned 20B | The model used for phase 2: FL2VA or Ref2VA (pruned or full, and their finetunes). |
 | **References (Ref2VA)** | | Shown only for a Ref2VA model: **Reference Images** (same gallery as Media Generator) and up to three **Reference Videos**, used by phase 2 to keep identities and appearance. Name them in the Phase 2 Prompt (`<Picture 1>`, `<Video 1>`...) if the prompt describes them. |
 | ↳ Apply the RefMods selected in Media Generator | off | Uses the RefMods chosen in the **MiniMax H3 RefMods (inline)** panel of Media Generator for this model (requires the MiniMax H3 RefMods plugin). |
@@ -52,7 +52,7 @@ A new **H3 Upscaler** tab runs MiniMax H3's phase 2 on a video that already exis
 
 The tab queues a normal two-phase generation for the selected FL2VA model, with these differences:
 1. **Phase 1 is replaced by your video.** The video is resampled to 24 fps and encoded with the H3 VAE at the phase 1 resolution. During phase 1 (a single step), the plugin answers in place of the model with the exact prediction of that latent, so phase 1 ends exactly on your video without any model computation.
-2. **The phase 1 to phase 2 scale is the chosen factor** (x1.5 to x3, limited to a 4096-pixel output) instead of WanGP's fixed x2. Phase 1 therefore runs at the source resolution, and the H3 latent upscaler enlarges by the chosen factor (single pass, see above).
+2. **The phase 1 to phase 2 scale is the chosen factor** (x1 to x3, limited to a 4096-pixel output) instead of WanGP's fixed x2. With x1 (refiner), phase 1 and phase 2 have the same size and the latent upscaler is skipped: the encoded video goes straight to phase 2. This only applies to H3 Upscaler tasks; Media Generator is unchanged. Phase 1 therefore runs at the source resolution, and the H3 latent upscaler enlarges by the chosen factor (single pass, see above).
 3. **The soundtrack is kept.** The source audio is given to the model as its soundtrack (`Generate Video based on Soundtrack and Text Prompt (Soundtrack Kept)`: audio mode `A` for FL2VA, `AS` for Ref2VA), so it is not regenerated. A video without audio gets a silent track.
 4. **Ref2VA references** (images, videos, RefMods) are given to the model as in Media Generator. The H3 pipeline re-encodes them at full resolution for phase 2, which is where they matter; in phase 1 they are encoded too but not used, since phase 1 is replaced by your video.
 5. **Phase 2 runs as usual** at the target resolution, with the chosen noise level start, Turbo LoRA multiplier and prompt.

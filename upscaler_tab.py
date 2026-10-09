@@ -23,7 +23,7 @@ REFMOD_SETTING = "h3_refmod_state"  # custom setting of the MiniMax H3 RefMods p
 REFERENCE_VIDEO_SLOTS = 3
 REFERENCE_VIDEO_MODES = {1: "V-U", 2: "V+-U", 3: "V+*-U"}  # Ref2VA: one, two or three whole reference videos
 DEFAULT_MODEL = "minimax_h3_fl2va_pruned"
-FACTOR_CHOICES = [("x1.5", 1.5), ("x2", 2.0), ("x2.5", 2.5), ("x3", 3.0)]
+FACTOR_CHOICES = [("x1 (refiner)", 1.0), ("x1.5", 1.5), ("x2", 2.0), ("x2.5", 2.5), ("x3", 3.0)]
 MAX_OUTPUT_SIZE = 4096  # longest output side, in pixels
 DEFAULT_FACTOR = 2.0
 DEFAULT_NOISE = 0.6
@@ -101,7 +101,7 @@ def _aligned(value):
 def _target_size(width, height, factor):
     """Output size for the factor, with the longest side limited to MAX_OUTPUT_SIZE. Returns (width, height, effective factor)."""
     phase_1_width, phase_1_height = _aligned(width), _aligned(height)
-    factor = min(float(factor), MAX_OUTPUT_SIZE / max(phase_1_width, phase_1_height))
+    factor = max(1.0, min(float(factor), MAX_OUTPUT_SIZE / max(phase_1_width, phase_1_height)))
     target_width = min(MAX_OUTPUT_SIZE, _aligned(phase_1_width * factor))
     target_height = min(MAX_OUTPUT_SIZE, _aligned(phase_1_height * factor))
     effective = (target_width / phase_1_width + target_height / phase_1_height) / 2.0
@@ -114,6 +114,8 @@ def _plan(path, factor, fps_choice=""):
     fps, force_fps = _resolve_fps(fps_choice, metadata)
     frames_available = _frames_at_fps(metadata, fps)
     frames = _usable_frames(frames_available)
+    if max(_aligned(width), _aligned(height)) > MAX_OUTPUT_SIZE:
+        raise gr.Error(f"The video is larger than {MAX_OUTPUT_SIZE} pixels: it cannot be processed.")
     target_width, target_height, effective_factor = _target_size(width, height, factor)
     return {"width": width, "height": height, "source_fps": float(metadata.get("fps_float") or 0.0), "fps": fps, "force_fps": force_fps,
             "frames_available": frames_available, "frames": frames, "target_width": target_width, "target_height": target_height,
@@ -136,7 +138,7 @@ def _plan_text(path, factor, fps_choice="", window_size=WINDOW_DEFAULT, overlap=
     fps = plan["fps"]
     lines = [f"**Source:** {plan['width']}x{plan['height']}, {plan['source_fps']:.3g} fps, {plan['frames_available']} frames at {fps} fps "
              f"({plan['frames_available'] / fps:.2f} s)",
-             f"**Output:** {plan['target_width']}x{plan['target_height']} at {fps} fps"]
+             f"**Output:** {plan['target_width']}x{plan['target_height']} at {fps} fps" + (" (refiner: same size, no upscale)" if plan["factor"] <= 1.0 else "")]
     if plan["effective_factor"] < plan["factor"] - 0.01:
         lines.append(f"The output is limited to {MAX_OUTPUT_SIZE} pixels: effective factor x{plan['effective_factor']:.2f} instead of x{plan['factor']:g}.")
     if plan["frames"] == 0:

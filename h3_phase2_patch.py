@@ -207,6 +207,15 @@ def _force_single_pass(upscaler, verbose=False):
 
 def _make_upscaler_forward(original_forward):
     def forward(self, *args, **kwargs):
+        # H3 Upscaler tab only, x1 (refiner): same size in and out, so the latent is returned unchanged, as the original
+        # ComfyUI node does, instead of running the network at a scale it was not meant for. Media Generator is not affected.
+        run = _current()
+        latent = args[0] if args else kwargs.get("latent")
+        target_size = kwargs.get("target_size", args[2] if len(args) > 2 else None)
+        if (run is not None and run.get("upscale") and latent is not None and target_size is not None
+                and tuple(int(size) for size in target_size) == tuple(latent.shape[2:])):
+            print(f"{LOG_PREFIX} latent upscaler skipped: same size in and out (x1 refiner)")
+            return latent
         _force_single_pass(self)
         return original_forward(self, *args, **kwargs)
 

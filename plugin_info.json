@@ -1,0 +1,12 @@
+{
+  "name": "2 Phases Plus",
+  "author": "",
+  "version": "2.4.0",
+  "description": "MiniMax H3 Two Phases: phase 2 Turbo LoRA multiplier, phase 2 prompt, extended noise range, single-pass latent upscaling, and an H3 Upscaler tab that runs phase 2 on an existing video.",
+  "type": [
+    "extension",
+    "app"
+  ],
+  "date": "2026-10-09",
+  "wan2gp_version": "17.17"
+}

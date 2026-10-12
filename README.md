@@ -33,7 +33,6 @@ A new **H3 Upscaler** tab runs MiniMax H3's phase 2 on a video that already exis
 | **Upscale Factor** | x2 | **x1 (refiner)**, x1.5, x2, x2.5 or x3. With x1, the output keeps the source size and phase 2 only refines the video (the latent upscaler is skipped). Other factors are applied to width and height (rounded to multiples of 32). The output is limited to **4096 pixels** on its longest side: beyond that, the factor is reduced and the panel shows the effective factor. |
 | **MiniMax H3 Model (FL2VA or Ref2VA)** | FL2VA Pruned 20B | The model used for phase 2: FL2VA or Ref2VA (pruned or full, and their finetunes). |
 | **References (Ref2VA)** | | Shown only for a Ref2VA model: **Reference Images** (same gallery as Media Generator) and up to three **Reference Videos**, used by phase 2 to keep identities and appearance. Name them in the Phase 2 Prompt (`<Picture 1>`, `<Video 1>`...) if the prompt describes them. |
-| ↳ Apply the RefMods selected in Media Generator | off | Uses the RefMods chosen in the **MiniMax H3 RefMods (inline)** panel of Media Generator for this model (requires the MiniMax H3 RefMods plugin). |
 | **Phase 2 Noise Level Start** | 0.6 | Same meaning as in the main form, with the live step count and sigmas. |
 | **Phase 2 Steps** (WanGP 18+) | 2 | Number of phase 2 steps (0.6 with 2 steps = sigmas 0.6, 0.3, 0). |
 | **Phase 2 Turbo LoRA Multiplier** | 0.5 | Strength of the phase 2 Turbo LoRA. |
@@ -41,6 +40,7 @@ A new **H3 Upscaler** tab runs MiniMax H3's phase 2 on a video that already exis
 | **Seed** | -1 | -1 for random. |
 | **Advanced** (closed by default) | | Three sub-tabs, as in Media Generator: |
 | ↳ **LoRAs**: Apply the LoRAs selected in Media Generator | off | Uses the LoRAs and multipliers chosen in the **LoRAs** tab of **Media Generator** for the selected model, including what other LoRA plugins do there. A summary lists them with the multiplier phase 2 will use (`a;b` → `b`; Turbo LoRAs → 0). **Refresh from Media Generator** updates it. |
+| ↳ **LoRAs**: MiniMax H3 RefMods (inline) | none | Shown only when the **MiniMax H3 RefMods** plugin is enabled and a Ref2VA model is selected. Same panel as in Media Generator (folder picker, image / video / audio RefMods with their strength, live reference counter), with its own selection: the RefMods picked here are used by this tab only, and the Media Generator selection is not used. |
 | ↳ **Sliding Window**: Sliding Window Size / Windows Frames Overlap | 481 / 18 | Videos longer than the window size are processed in several windows (up to 737 frames, about 30 s). |
 | ↳ **Misc.**: Text Encoder / Video VAE / DiT Denoising Priority | model default | Config variations of the selected model, as in Misc. The list follows the selected model. |
 | ↳ **Misc.**: Override Frames Per Second | model default (24 fps) | Generation frame rate. **Source Video fps** uses the source frame rate (rounded). The source is resampled to this rate, and the frame limits apply at this rate. |

@@ -34,7 +34,7 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "2 Phases Plus"
-        self.version = "2.6.1"
+        self.version = "2.7.0"
         self.description = "MiniMax H3 Two Phases: phase 2 Turbo LoRA multiplier, phase 2 prompt, extended noise range, and an H3 Upscaler tab."
         self._ui_built = False
         self._hooks_installed = False
@@ -159,6 +159,14 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
 
     def _make_prepare_hook(self, original_prepare):
         def prepare_inputs_dict(target, inputs, model_type=None, model_filename=None):
+            upscale_refmods = None
+            try:
+                existing = inputs.get("custom_settings") if isinstance(inputs, dict) else None
+                if isinstance(existing, dict) and existing.get(patch.UPSCALE_SOURCE_KEY):
+                    # H3 Upscaler task: its RefMods come from the tab's own panel, not from the Media Generator selection
+                    upscale_refmods = (existing.get(upscaler_tab.REFMOD_SETTING) or "",)
+            except Exception:
+                upscale_refmods = None
             try:
                 if target in SAVE_TARGETS and isinstance(inputs, dict):
                     state = inputs.get("state")
@@ -170,7 +178,18 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
                     patch.install(verbose=False)  # queue time: make sure the pipeline patch is still in place
             except Exception as error:
                 print(f"{patch.LOG_PREFIX} could not attach the phase 2 values: {error}")
-            return original_prepare(target, inputs, model_type, model_filename)
+            result = original_prepare(target, inputs, model_type, model_filename)
+            if upscale_refmods is not None and isinstance(result, dict):
+                try:
+                    settings = dict(result.get("custom_settings") or {})
+                    if upscale_refmods[0]:
+                        settings[upscaler_tab.REFMOD_SETTING] = upscale_refmods[0]
+                    else:
+                        settings.pop(upscaler_tab.REFMOD_SETTING, None)
+                    result["custom_settings"] = settings
+                except Exception:
+                    pass
+            return result
 
         prepare_inputs_dict.__wrapped__ = original_prepare
         setattr(prepare_inputs_dict, HOOK_MARKER, True)

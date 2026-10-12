@@ -235,32 +235,48 @@ def _is_ref2va(model_type):
     return str(model_def.get("architecture", "")) in REF2VA_ARCHITECTURES
 
 
-def _media_generator_refmods(state, model_type):
-    """The RefMods selection of the MiniMax H3 RefMods plugin for this model in Media Generator (or None)."""
+REFMOD_PLUGIN_ID = "H3RefMods"  # PlugIn_Id of the MiniMax H3 RefMods plugin
+REFMOD_PLUGIN_CLASS = "MiniMaxH3RefModsPlugin"
+
+
+def _refmod_plugin_module():
+    """The plugin module of the MiniMax H3 RefMods plugin when it is enabled (WanGP only imports enabled plugins), else None."""
+    import sys
+    enabled = None
     wgp = _wgp()
-    if wgp is None or not isinstance(state, dict) or not model_type:
-        return None
-    try:
-        settings = wgp.get_model_settings(state, model_type) or {}
-    except Exception:
-        return None
-    value = (settings.get("custom_settings") or {}).get(REFMOD_SETTING)
-    return value if value else None
+    if wgp is not None and isinstance(getattr(wgp, "server_config", None), dict):
+        enabled = set(wgp.server_config.get("enabled_plugins") or [])
+    for name, module in list(sys.modules.items()):
+        if module is None or getattr(module, "PlugIn_Id", None) != REFMOD_PLUGIN_ID or not hasattr(module, REFMOD_PLUGIN_CLASS):
+            continue
+        package = name.rsplit(".", 1)[0] if "." in name else name
+        if enabled is not None and package not in enabled and name not in enabled:
+            continue
+        return module
+    return None
 
 
-def _refmods_text(state, model_type, use_refmods):
-    if not use_refmods or not _is_ref2va(model_type):
-        return ""
-    value = _media_generator_refmods(state, model_type)
-    if value is None:
-        return "No RefMod is selected in the **MiniMax H3 RefMods (inline)** panel of Media Generator for this model."
-    try:
-        import json
-        parsed = json.loads(value) if isinstance(value, str) else value
-        count = len(parsed.get("rows") or []) if isinstance(parsed, dict) else None
-    except Exception:
-        count = None
-    return "RefMods selection found in Media Generator" + (f" ({count} mod(s))." if count else ".")
+def _refmod_payload(refmod_module, values):
+    """RefMods selection (JSON) from the (mod, strength) values of the inline picker rows, exactly as the RefMods plugin builds it."""
+    import json
+    none_choice = getattr(refmod_module, "NONE_CHOICE", "(none)")
+    rows = []
+    for index in range(0, len(values) - 1, 2):
+        mod, strength = values[index], values[index + 1]
+        try:
+            strength = float(strength)
+        except (TypeError, ValueError):
+            continue
+        if mod and mod != none_choice and strength > 0:
+            rows.append({"mod": mod, "strength": strength})
+    if not rows:
+        return None, 0
+    return json.dumps({"rows": rows, "retention": 1.0, "scramble_seed": -1, "curve": None}), len(rows)
+
+
+def _refmods_status(refmod_module, *values):
+    _, count = _refmod_payload(refmod_module, values)
+    return f"✅ {count} RefMod(s) armed for the next Ref2VA upscale from this tab." if count else "*No RefMods selected.*"
 
 
 def _media_generator_loras(state, model_type):
@@ -396,6 +412,7 @@ def create_tab(plugin, api_session):
     from shared.gradio.gallery import AdvancedMediaGallery, get_gradio_file_path
 
     active_job = {"job": None}
+    refmod_module = _refmod_plugin_module()
     model_choices = _model_choices()
     default_model = model_choices[0][1] if model_choices else None
     state_component = getattr(plugin, "state", None)
@@ -411,7 +428,8 @@ def create_tab(plugin, api_session):
                 plan_info = gr.Markdown("")
                 factor = gr.Radio(choices=FACTOR_CHOICES, value=DEFAULT_FACTOR, label=f"Upscale Factor (width and height, output limited to {MAX_OUTPUT_SIZE} pixels)")
                 model = gr.Dropdown(choices=model_choices, value=default_model, label="MiniMax H3 Model (FL2VA or Ref2VA)",
-                                    info="Model used for phase 2. Ref2VA can use reference images / videos and RefMods; Turbo finetunes double the Turbo effect.")
+                                    info="Model used for phase 2. Ref2VA can use reference images / videos" + (" and RefMods (Advanced > LoRAs)" if refmod_module is not None else "")
+                                         + "; Turbo finetunes double the Turbo effect.")
         with gr.Column(visible=_is_ref2va(default_model)) as references:
             gr.Markdown("**References (Ref2VA)**: used by phase 2 to keep identities and appearance. Name them in the Phase 2 Prompt "
                         "(`<Picture 1>`, `<Video 1>`...) if the prompt describes them.")
@@ -421,8 +439,6 @@ def create_tab(plugin, api_session):
                     image_refs_gallery.mount()
                 reference_videos = [gr.Video(label=f"Reference Video {index + 1}", sources=["upload"], height=REFERENCE_HEIGHT, min_width=160)
                                     for index in range(REFERENCE_VIDEO_SLOTS)]
-            use_refmods = gr.Checkbox(value=False, label="Apply the RefMods selected in Media Generator (MiniMax H3 RefMods inline panel) for this model")
-            refmods_info = gr.Markdown("")
         noise_level = gr.Slider(minimum=patch.NOISE_LEVEL_MIN, maximum=1.0, step=0.01, value=DEFAULT_NOISE,
                                 label=patch.noise_level_label(), show_reset_button=False)
         phase_2_steps = gr.Slider(minimum=1, maximum=10, step=1, value=DEFAULT_PHASE_2_STEPS, label="Phase 2 Steps",
@@ -444,6 +460,19 @@ def create_tab(plugin, api_session):
                                 "matters: `a;b` uses `b`, a single value is used as is. Turbo LoRAs are set to 0 in phase 2, as in normal generations.")
                     loras_info = gr.Markdown("")
                     refresh_loras = gr.Button("Refresh from Media Generator", size="sm")
+                    refmod_rows, refmods_section = [], None
+                    if refmod_module is not None:
+                        with gr.Accordion("MiniMax H3 RefMods (inline)", open=False, visible=_is_ref2va(default_model)) as refmods_section:
+                            gr.Markdown("Applies only when a **MiniMax H3 Ref2VA** model is selected above. Same panel as in Media Generator, "
+                                        "with its own selection: the RefMods picked here are used by this tab only. Extract new RefMods "
+                                        "from the **MiniMax H3 RefMods** tab.")
+                            try:
+                                refmod_rows = list(getattr(refmod_module, REFMOD_PLUGIN_CLASS)._build_mod_picker_rows(None))
+                            except Exception as error:
+                                refmod_rows = []
+                                print(f"{patch.LOG_PREFIX} H3 Upscaler: could not build the RefMods panel: {error!r}")
+                                gr.Markdown(f"⚠️ The RefMods panel could not be built ({error!r}).")
+                            refmods_info = gr.Markdown("*No RefMods selected.*")
                 with gr.Tab("Sliding Window"):
                     window_size = gr.Slider(minimum=WINDOW_MIN, maximum=WINDOW_MAX, step=WINDOW_STEP, value=WINDOW_DEFAULT,
                                             label="Sliding Window Size", show_reset_button=False)
@@ -466,9 +495,11 @@ def create_tab(plugin, api_session):
 
     def run_upscale(video_path, factor_value, model_type, noise_value, multiplier_value, prompt_value, seed_value,
                     fps_value, profile_value, attention_value, tiling_value, use_loras_value, window_value, overlap_value,
-                    use_refmods_value, image_refs_value, phase_2_steps_value, state_value, *rest):
+                    image_refs_value, phase_2_steps_value, state_value, *rest):
         # A generator, run directly by WanGP's WebUI session wrapper (it keeps the Gradio session needed to queue the task).
-        config_values, reference_video_values = rest[:CONFIG_SLOTS], rest[CONFIG_SLOTS:]
+        config_values = rest[:CONFIG_SLOTS]
+        reference_video_values = rest[CONFIG_SLOTS:CONFIG_SLOTS + REFERENCE_VIDEO_SLOTS]
+        refmod_values = rest[CONFIG_SLOTS + REFERENCE_VIDEO_SLOTS:]
         if not video_path:
             raise gr.Error("Load a video first.")
         if not model_type:
@@ -488,7 +519,7 @@ def create_tab(plugin, api_session):
         if ref2va:
             image_refs = _copy_inputs([get_gradio_file_path(item) for item in (image_refs_value or [])], "ref_image")
             videos = _copy_inputs([video for video in reference_video_values if video], "ref_video")
-            refmods = _media_generator_refmods(state_value, model_type) if use_refmods_value else None
+            refmods = _refmod_payload(refmod_module, refmod_values)[0] if refmod_module is not None and refmod_values else None
         settings = build_settings(source_copy, wav_path, plan, factor_value, model_type, noise_value, multiplier_value, prompt_value, seed_value,
                                   config=config, override_profile=profile_value, override_attention=attention_value, tiling=bool(tiling_value),
                                   loras=loras, loras_multipliers=loras_multipliers, window_size=window_value, overlap=overlap_value,
@@ -542,22 +573,26 @@ def create_tab(plugin, api_session):
             job.cancel()
 
     def model_changed(model_type):
+        ref2va = _is_ref2va(model_type)
         return [*_config_dropdown_updates(model_type), gr.update(choices=_attention_choices(model_type), value=""),
-                gr.update(visible=_is_ref2va(model_type))]
+                gr.update(visible=ref2va)] + ([gr.update(visible=ref2va)] if refmods_section is not None else [])
 
     plan_inputs = [source_video, factor, fps_choice, window_size, window_overlap]
     for component in plan_inputs:
         component.change(fn=_plan_text, inputs=plan_inputs, outputs=[plan_info], show_progress="hidden")
     for component in (noise_level, phase_2_steps):
         component.change(fn=patch.phase_2_steps_text, inputs=[noise_level, phase_2_steps], outputs=[steps_info], show_progress="hidden", queue=False)
-    model.change(fn=model_changed, inputs=[model], outputs=[*config_dropdowns, override_attention, references], show_progress="hidden")
+    model.change(fn=model_changed, inputs=[model], show_progress="hidden",
+                 outputs=[*config_dropdowns, override_attention, references] + ([refmods_section] if refmods_section is not None else []))
     for trigger in (model.change, refresh_loras.click, use_loras.change):
         trigger(fn=lambda state_value, model_type: _loras_text(state_value, model_type), inputs=[*state_input, model], outputs=[loras_info], show_progress="hidden")
-    for trigger in (model.change, use_refmods.change):
-        trigger(fn=_refmods_text, inputs=[*state_input, model, use_refmods], outputs=[refmods_info], show_progress="hidden")
+    refmod_widgets = [component for row in refmod_rows for component in row]
+    for component in refmod_widgets:
+        component.change(fn=lambda *values: _refmods_status(refmod_module, *values), inputs=refmod_widgets, outputs=[refmods_info],
+                         show_progress="hidden", queue=False)
     copy_prompt.click(fn=_read_prompt, inputs=[source_video], outputs=[prompt])
     start.click(fn=run_upscale, inputs=[source_video, factor, model, noise_level, multiplier, prompt, seed,
                                         fps_choice, override_profile, override_attention, tiling, use_loras, window_size, window_overlap,
-                                        use_refmods, image_refs_gallery.gallery, phase_2_steps, *state_input, *config_dropdowns, *reference_videos],
+                                        image_refs_gallery.gallery, phase_2_steps, *state_input, *config_dropdowns, *reference_videos, *refmod_widgets],
                 outputs=[status])
     abort.click(fn=cancel, queue=False)

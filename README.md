@@ -10,7 +10,7 @@ When **Two Phases** or **Two Phases with Tiling** is selected, two controls appe
 | **Phase 2 Prompt (optional)** | text | empty | Prompt used only by phase 2. Empty means phase 2 reuses the main prompt, which is WanGP's normal behaviour. |
 
 The plugin also extends **Phase 2 Noise Level Start** itself:
-- Its default becomes **0.6** (2 phase 2 steps) instead of WanGP's 0.9035, in the default settings of the two-phase MiniMax H3 models. This applies to factory settings and to saved default settings that still hold WanGP's untouched 0.9035; a value you set yourself is kept, and settings loaded from a video or a settings file are not changed.
+- Its default becomes **0.6** instead of WanGP's 0.9035, and on WanGP 18+ the default of **Phase 2 Steps** becomes **2** instead of 3 (sigmas 0.6, 0.3, 0), in the default settings of the two-phase MiniMax H3 models. This applies to factory settings and to saved default settings that still hold WanGP's untouched values (0.9035 / 3 steps); a value you set yourself is kept, and settings loaded from a video or a settings file are not changed.
 - Its minimum goes down from 0.7 (WanGP) to **0.01**.
 - Its label shows the step limits: `Phase 2 Noise Level Start (≤ 0.3158: 1 step | ≤ 0.6316: 2 steps | > 0.6316: 3 steps)`.
 - A line above the two controls shows, live, the number of phase 2 steps and the exact sigmas for the current value, for example **Phase 2: 2 steps** (sigmas 0.5, 0.3158, 0).
@@ -34,7 +34,8 @@ A new **H3 Upscaler** tab runs MiniMax H3's phase 2 on a video that already exis
 | **MiniMax H3 Model (FL2VA or Ref2VA)** | FL2VA Pruned 20B | The model used for phase 2: FL2VA or Ref2VA (pruned or full, and their finetunes). |
 | **References (Ref2VA)** | | Shown only for a Ref2VA model: **Reference Images** (same gallery as Media Generator) and up to three **Reference Videos**, used by phase 2 to keep identities and appearance. Name them in the Phase 2 Prompt (`<Picture 1>`, `<Video 1>`...) if the prompt describes them. |
 | ↳ Apply the RefMods selected in Media Generator | off | Uses the RefMods chosen in the **MiniMax H3 RefMods (inline)** panel of Media Generator for this model (requires the MiniMax H3 RefMods plugin). |
-| **Phase 2 Noise Level Start** | 0.6 | Same meaning as in the main form, with the live step count (0.6 = 2 steps). |
+| **Phase 2 Noise Level Start** | 0.6 | Same meaning as in the main form, with the live step count and sigmas. |
+| **Phase 2 Steps** (WanGP 18+) | 2 | Number of phase 2 steps (0.6 with 2 steps = sigmas 0.6, 0.3, 0). |
 | **Phase 2 Turbo LoRA Multiplier** | 0.5 | Strength of the phase 2 Turbo LoRA. |
 | **Phase 2 Prompt** | `.` | `.` means no description: phase 2 only refines what it sees. **Copy the Prompt from the Video Properties** fills it with the prompt stored in a WanGP video's metadata. |
 | **Seed** | -1 | -1 for random. |

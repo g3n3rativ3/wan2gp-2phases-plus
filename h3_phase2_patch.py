@@ -30,6 +30,8 @@ DEFAULT_MULTIPLIER = 0.5  # plugin default of the phase 2 Turbo LoRA multiplier 
 WANGP_MULTIPLIER = 1.0  # what WanGP itself uses: no change needed at that value
 NOISE_LEVEL_DEFAULT = 0.6  # plugin default of "Phase 2 Noise Level Start" (2 phase 2 steps)
 WANGP_NOISE_LEVEL_DEFAULT = 0.9035  # WanGP's default, replaced by NOISE_LEVEL_DEFAULT in default settings only
+PHASE_2_STEPS_DEFAULT = 2  # plugin default of WanGP 18+ "Phase 2 Steps"
+WANGP_PHASE_2_STEPS_DEFAULT = 3  # WanGP's default, replaced by PHASE_2_STEPS_DEFAULT in default settings only
 LOG_PREFIX = "[2 Phases Plus]"
 PATCH_MARKER = "_two_phases_plus_patch"
 # Lowest "Phase 2 Noise Level Start" offered by the plugin (WanGP's own minimum is 0.7).
@@ -402,7 +404,7 @@ def phase_2_schedule(start, steps=None):
         return None
     fixed = (_DEFAULT_PHASE_2_SIGMAS or (0.9035, *PHASE_2_FIXED_SIGMAS, 0.0))[1:-1]
     if phase_2_steps_supported():
-        steps = 3 if steps in (None, "") else max(1, int(steps))
+        steps = PHASE_2_STEPS_DEFAULT if steps in (None, "") else max(1, int(steps))
         if steps == len(fixed) + 1 and start > fixed[0]:
             return (start, *fixed, 0.0)
         return tuple(round(start * (steps - index) / steps, 4) for index in range(steps + 1))
@@ -448,6 +450,13 @@ def _apply_plugin_noise_default(model_def, ui_defaults):
             ui_defaults["switch_threshold"] = NOISE_LEVEL_DEFAULT
     except (TypeError, ValueError):
         pass
+    if phase_2_steps_supported() and model_def.get("inference_steps2", True):
+        steps = ui_defaults.get("num_inference_steps2")
+        try:
+            if steps is None or int(steps) == WANGP_PHASE_2_STEPS_DEFAULT:
+                ui_defaults["num_inference_steps2"] = PHASE_2_STEPS_DEFAULT
+        except (TypeError, ValueError):
+            pass
 
 
 def extend_noise_level_range():
@@ -490,7 +499,8 @@ def extend_noise_level_range():
             if isinstance(model_def, dict) and str(model_def.get("architecture", "")).startswith("minimax_h3") and _lower_noise_min(model_def):
                 count += 1
     print(f"{LOG_PREFIX} Phase 2 Noise Level Start minimum lowered to {NOISE_LEVEL_MIN:g} ({count} loaded MiniMax H3 model definition(s) updated); "
-          f"defaults: noise level start {NOISE_LEVEL_DEFAULT:g}, phase 2 Turbo LoRA multiplier {DEFAULT_MULTIPLIER:g}")
+          f"defaults: noise level start {NOISE_LEVEL_DEFAULT:g}{f', phase 2 steps {PHASE_2_STEPS_DEFAULT}' if phase_2_steps_supported() else ''}, "
+          f"phase 2 Turbo LoRA multiplier {DEFAULT_MULTIPLIER:g}")
     return True
 
 

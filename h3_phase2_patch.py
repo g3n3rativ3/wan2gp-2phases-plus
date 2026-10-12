@@ -40,7 +40,26 @@ NOISE_LEVEL_MIN = 0.01
 UPSCALER_TEMPORAL_CHUNK = 1024
 # Fixed intermediate sigmas of WanGP's phase 2 schedule (start, 0.6316, 0.3158, 0)
 PHASE_2_FIXED_SIGMAS = (0.6316, 0.3158)
-NOISE_LEVEL_LABEL = "Phase 2 Noise Level Start (≤ 0.3158: 1 step | ≤ 0.6316: 2 steps | > 0.6316: 3 steps)"
+NOISE_LEVEL_LABEL_FIXED_STEPS = "Phase 2 Noise Level Start (≤ 0.3158: 1 step | ≤ 0.6316: 2 steps | > 0.6316: 3 steps)"
+NOISE_LEVEL_LABEL_STEPS_SETTING = "Phase 2 Noise Level Start (with 3 Phase 2 Steps: fixed schedule above 0.6316, evenly spaced at or below)"
+_PHASE_2_STEPS_SUPPORTED = None
+
+
+def phase_2_steps_supported():
+    """True for WanGP versions with the "Phase 2 Steps" setting (MiniMaxH3Pipeline.generate(sampling_steps2=...), WanGP 18+)."""
+    global _PHASE_2_STEPS_SUPPORTED
+    if _PHASE_2_STEPS_SUPPORTED is None:
+        try:
+            import inspect
+            from models.minimax_h3 import pipeline as h3_pipeline
+            _PHASE_2_STEPS_SUPPORTED = "sampling_steps2" in inspect.signature(h3_pipeline.MiniMaxH3Pipeline.generate).parameters
+        except Exception:
+            _PHASE_2_STEPS_SUPPORTED = False
+    return _PHASE_2_STEPS_SUPPORTED
+
+
+def noise_level_label():
+    return NOISE_LEVEL_LABEL_STEPS_SETTING if phase_2_steps_supported() else NOISE_LEVEL_LABEL_FIXED_STEPS
 
 _state = threading.local()
 _installed = False
@@ -104,12 +123,13 @@ def _make_generate(original_generate):
                   f"phase 2 Turbo LoRA multiplier {multiplier:g}, phase 2 prompt {'set (' + str(len(phase2_prompt)) + ' characters)' if phase2_prompt else 'empty'}")
         schedule_override = None
         if two_phase:
-            schedule_override = _phase_2_schedule_for(kwargs.get("switch_threshold"))
+            schedule_override = _phase_2_schedule_for(kwargs.get("switch_threshold"), kwargs.get("sampling_steps2"))
         previous = _current()
         _state.run = {
             "multiplier": multiplier,
             "prompt": phase2_prompt,
             "loras_selected": list(kwargs.get("loras_selected") or ()),
+            "pipeline": self,
             "phase_2": False,
             "prompt_done": False,
         }
@@ -134,8 +154,9 @@ def _make_generate(original_generate):
                 print(f"{LOG_PREFIX} H3 Upscaler: phase 1 replaced by the source video '{os.path.basename(str(upscale_source))}', upscale x{factor:g}")
             if schedule_override is not None and original_schedule is not None:
                 h3_pipeline.H3_PHASE_2_SIGMAS = schedule_override
+                actual = phase_2_schedule(schedule_override[0], kwargs.get("sampling_steps2"))
                 print(f"{LOG_PREFIX} phase 2 noise level start {schedule_override[0]:g} is at or below {original_schedule[1]:g}: "
-                      f"phase 2 sigmas {', '.join(f'{value:g}' for value in schedule_override)} ({len(schedule_override) - 1} step(s))")
+                      f"phase 2 sigmas {', '.join(f'{value:g}' for value in actual)} ({len(actual) - 1} step(s))")
             return original_generate(self, *args, **kwargs)
         finally:
             if restore_forward is not None:
@@ -159,9 +180,21 @@ def _make_update_loras_slists(original_update_loras_slists, is_required_turbo):
             multiplier = run["multiplier"]
             if multiplier != WANGP_MULTIPLIER:
                 turbo_index = None
-                if is_required_turbo is not None:
+                phase_2_loras = getattr(run.get("pipeline"), "_phase_2_loras", None)
+                if isinstance(phase_2_loras, (tuple, list)) and phase_2_loras:
+                    # WanGP 18+: the automatic Turbo LoRA is the first LoRA after the model's own; WanGP sets its phase 2 multiplier
+                    # to 0 when accelerator LoRAs given before "|" replace it, and to 1 otherwise
+                    turbo_index = int(phase_2_loras[0])
+                    phase_2_values = slists_dict.get("phase2", ())
+                    current = phase_2_values[turbo_index] if turbo_index < len(phase_2_values) else None
+                    if current is not None and not isinstance(current, list) and float(current) == 0.0:
+                        print(f"{LOG_PREFIX} phase 2: the automatic Turbo LoRA is replaced by your accelerator LoRAs, multiplier {multiplier:g} not applied")
+                        turbo_index = -1
+                elif is_required_turbo is not None:  # older WanGP: the automatic Turbo LoRA is found by its file name
                     turbo_index = next((index for index, lora in enumerate(run["loras_selected"]) if is_required_turbo(_lora_name(lora))), None)
-                if turbo_index is None or turbo_index >= len(slists_dict.get("phase2", ())):
+                if turbo_index == -1:
+                    pass
+                elif turbo_index is None or turbo_index >= len(slists_dict.get("phase2", ())):
                     print(f"{LOG_PREFIX} phase 2: no built-in Turbo LoRA found, multiplier {multiplier:g} not applied")
                 else:
                     slists_dict = dict(slists_dict)
@@ -169,7 +202,8 @@ def _make_update_loras_slists(original_update_loras_slists, is_required_turbo):
                     slists_dict["shared"] = list(slists_dict["shared"])
                     slists_dict["phase2"][turbo_index] = float(multiplier)
                     slists_dict["shared"][turbo_index] = False
-                    print(f"{LOG_PREFIX} phase 2: Turbo LoRA '{_lora_name(run['loras_selected'][turbo_index])}' multiplier set to {multiplier:g} (default 1.0)")
+                    name = _lora_name(run["loras_selected"][turbo_index]) if turbo_index < len(run["loras_selected"]) else "automatic Turbo"
+                    print(f"{LOG_PREFIX} phase 2: Turbo LoRA '{name}' multiplier set to {multiplier:g} (default 1.0)")
         return original_update_loras_slists(trans, slists_dict, num_inference_steps, phase_switch_step=phase_switch_step, phase_switch_step2=phase_switch_step2)
 
     return _mark(update_loras_slists, original_update_loras_slists)
@@ -230,9 +264,12 @@ def _pipeline_module():
     return h3_pipeline
 
 
-def _phase_2_schedule_for(switch_threshold):
-    """WanGP builds the phase 2 schedule as (noise level start, 0.6316, 0.3158, 0). Below 0.6316 that schedule would
-    go back up in noise, so only the fixed sigmas lower than the start are kept. Returns None when no change is needed."""
+def _phase_2_schedule_for(switch_threshold, steps=None):
+    """WanGP's 3-step phase 2 schedule is (noise level start, 0.6316, 0.3158, 0). At or below 0.6316 it would go back up
+    in noise. Returns a replacement for H3_PHASE_2_SIGMAS for this generation, or None when no change is needed:
+    - older WanGP (fixed 3 steps): only the fixed sigmas lower than the start are kept (2 or 1 step);
+    - WanGP 18+ ("Phase 2 Steps"): with 3 steps, the fixed schedule is avoided so that WanGP uses evenly spaced sigmas
+      from the start (its schedule for any other step count); other step counts are already evenly spaced."""
     global _DEFAULT_PHASE_2_SIGMAS
     try:
         start = float(switch_threshold)
@@ -246,6 +283,10 @@ def _phase_2_schedule_for(switch_threshold):
     intermediate = _DEFAULT_PHASE_2_SIGMAS[1:-1]
     if not intermediate or start > intermediate[0] or start <= 0.0:
         return None
+    if phase_2_steps_supported():
+        if steps is not None and int(steps) != len(_DEFAULT_PHASE_2_SIGMAS) - 1:
+            return None
+        return (start, 0.0)  # any length other than steps + 1 makes WanGP use its evenly spaced schedule
     return (start, *[value for value in intermediate if value < start], 0.0)
 
 
@@ -353,24 +394,29 @@ def _find_wgp_module():
     return None
 
 
-def phase_2_schedule(start):
-    """Phase 2 sigmas used for a given noise level start (WanGP's schedule above 0.6316, the plugin's below)."""
+def phase_2_schedule(start, steps=None):
+    """Phase 2 sigmas actually used for a noise level start (and, on WanGP 18+, a Phase 2 Steps count)."""
     try:
         start = float(start)
     except (TypeError, ValueError):
         return None
-    intermediate = (_DEFAULT_PHASE_2_SIGMAS or (0.9035, *PHASE_2_FIXED_SIGMAS, 0.0))[1:-1]
-    if intermediate and start > intermediate[0]:
-        return (start, *intermediate, 0.0)
-    return (start, *[value for value in intermediate if value < start], 0.0)
+    fixed = (_DEFAULT_PHASE_2_SIGMAS or (0.9035, *PHASE_2_FIXED_SIGMAS, 0.0))[1:-1]
+    if phase_2_steps_supported():
+        steps = 3 if steps in (None, "") else max(1, int(steps))
+        if steps == len(fixed) + 1 and start > fixed[0]:
+            return (start, *fixed, 0.0)
+        return tuple(round(start * (steps - index) / steps, 4) for index in range(steps + 1))
+    if fixed and start > fixed[0]:
+        return (start, *fixed, 0.0)
+    return (start, *[value for value in fixed if value < start], 0.0)
 
 
-def phase_2_steps_text(start):
-    schedule = phase_2_schedule(start)
+def phase_2_steps_text(start, steps=None):
+    schedule = phase_2_schedule(start, steps)
     if schedule is None:
         return ""
-    steps = len(schedule) - 1
-    return f"**Phase 2: {steps} step{'s' if steps > 1 else ''}** (sigmas {', '.join(f'{value:g}' for value in schedule)})"
+    count = len(schedule) - 1
+    return f"**Phase 2: {count} step{'s' if count > 1 else ''}** (sigmas {', '.join(f'{value:g}' for value in schedule)})"
 
 
 def _lower_noise_min(model_def):
@@ -381,8 +427,8 @@ def _lower_noise_min(model_def):
     if float(setting.get("min", NOISE_LEVEL_MIN)) > NOISE_LEVEL_MIN:
         setting = {**setting, "min": NOISE_LEVEL_MIN}
         changed = True
-    if setting.get("label") != NOISE_LEVEL_LABEL:
-        setting = {**setting, "label": NOISE_LEVEL_LABEL}
+    if setting.get("label") != noise_level_label():
+        setting = {**setting, "label": noise_level_label()}
         changed = True
     if changed:
         model_def["switch_threshold"] = setting

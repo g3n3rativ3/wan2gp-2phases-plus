@@ -34,7 +34,7 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "2 Phases Plus"
-        self.version = "2.5.0"
+        self.version = "2.6.0"
         self.description = "MiniMax H3 Two Phases: phase 2 Turbo LoRA multiplier, phase 2 prompt, extended noise range, and an H3 Upscaler tab."
         self._ui_built = False
         self._hooks_installed = False
@@ -44,7 +44,7 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
     def setup_ui(self):
         patch.extend_noise_level_range()  # before the UI is built, so the slider starts with the extended range
         self.add_tab(tab_id="h3_upscaler", label="H3 Upscaler", component_constructor=self.create_upscaler_tab)
-        for component_id in ("state", "guidance_phases", "guidance_phases_row", "refresh_form_trigger", "model_choice_target", "switch_threshold"):
+        for component_id in ("state", "guidance_phases", "guidance_phases_row", "refresh_form_trigger", "model_choice_target", "switch_threshold", "num_inference_steps2"):
             self.request_component(component_id)
 
     def post_ui_setup(self, components):
@@ -66,7 +66,10 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
         initial_state = state_component.value if isinstance(state_component.value, dict) else {}
         initial_visible = self._controls_visible(initial_state.get("model_type"), guidance_phases.value)
         switch_threshold = components.get("switch_threshold")
-        initial_steps_text = patch.phase_2_steps_text(switch_threshold.value) if switch_threshold is not None else ""
+        phase_2_steps = components.get("num_inference_steps2")  # WanGP 18+ "Phase 2 Steps" (absent in older versions)
+        steps_inputs = [component for component in (switch_threshold, phase_2_steps) if component is not None]
+        initial_steps_text = (patch.phase_2_steps_text(switch_threshold.value, phase_2_steps.value if phase_2_steps is not None else None)
+                              if switch_threshold is not None else "")
 
         def build_controls():
             with gr.Column(visible=initial_visible, elem_id="two_phases_plus_controls") as controls:
@@ -87,8 +90,9 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
                 model_choice_target.change(fn=self._visibility_from_target, inputs=[model_choice_target, guidance_phases],
                                            outputs=[controls], show_progress="hidden")
             if switch_threshold is not None:
-                switch_threshold.change(fn=patch.phase_2_steps_text, inputs=[switch_threshold], outputs=[steps_info],
-                                        show_progress="hidden", queue=False)
+                for component in steps_inputs:
+                    component.change(fn=patch.phase_2_steps_text, inputs=steps_inputs, outputs=[steps_info],
+                                     show_progress="hidden", queue=False)
             if refresh_form_trigger is not None:  # settings loaded from a video, an image or a settings file
                 refresh_form_trigger.change(fn=self._load_from_settings, inputs=[state_component],
                                             outputs=[multiplier, phase2_prompt, controls], show_progress="hidden")

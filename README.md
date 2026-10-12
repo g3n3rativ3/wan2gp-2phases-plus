@@ -163,7 +163,10 @@ For every two-phase generation the console reports the values used:
 - When a queued task is edited, the current values of the controls are applied to it.
 - If a future WanGP version changes the H3 two-phase code, the plugin may stop applying its values. It never blocks generation: the console simply no longer reports the phase 2 lines.
 - Settings saved with a noise level start below 0.7 need this plugin: without it, WanGP rejects them (minimum 0.7).
-- Tested against WanGP v17.17.
+- Tested against WanGP v17.17 and v18.02. WanGP 18 added a native **Phase 2 Steps** setting (default 3) and accelerator LoRAs given before `|` that replace the automatic Turbo; the plugin follows both:
+  - the Phase 2 Turbo LoRA Multiplier only applies to WanGP's automatic Turbo LoRA; when your own accelerator LoRAs replace it (nonzero phase 2 multiplier before `|`), the plugin leaves them as you set them;
+  - with 3 Phase 2 Steps, WanGP's fixed schedule (start, 0.6316, 0.3158, 0) is kept above 0.6316; at or below, where it would go back up in noise, the plugin makes WanGP use evenly spaced sigmas from the start (for example 0.6, 0.4, 0.2, 0). Other step counts are already evenly spaced by WanGP. The live indicator and the H3 Upscaler tab (which gets its own **Phase 2 Steps** slider on WanGP 18+) show the real schedule;
+  - on older WanGP versions, the noise level start still decides the step count (3, 2 or 1 step), as before.
 
 ## Uninstall
 

@@ -27,6 +27,7 @@ FACTOR_CHOICES = [("x1 (refiner)", 1.0), ("x1.5", 1.5), ("x2", 2.0), ("x2.5", 2.
 MAX_OUTPUT_SIZE = 4096  # longest output side, in pixels
 DEFAULT_FACTOR = 2.0
 DEFAULT_NOISE = 0.6
+DEFAULT_PHASE_2_STEPS = 3  # WanGP 18+ "Phase 2 Steps" (older WanGP: fixed by the noise level start)
 DEFAULT_MULTIPLIER = 0.5
 DEFAULT_PROMPT = "."
 FPS = 24  # MiniMax H3 default frame rate
@@ -333,7 +334,7 @@ def _read_prompt(path):
 def build_settings(source_copy, wav_path, plan, factor, model_type, noise_level, multiplier, prompt, seed,
                    config="", override_profile=-1, override_attention="", tiling=False, loras=None, loras_multipliers="",
                    window_size=WINDOW_DEFAULT, overlap=OVERLAP_DEFAULT, ref2va=False, image_refs=None, reference_videos=None,
-                   refmods=None):
+                   refmods=None, phase_2_steps=None):
     frames = plan["frames"]
     image_refs = list(image_refs or [])
     reference_videos = list(reference_videos or [])[:REFERENCE_VIDEO_SLOTS]
@@ -379,6 +380,8 @@ def build_settings(source_copy, wav_path, plan, factor, model_type, noise_level,
             patch.UPSCALE_FACTOR_KEY: float(plan["effective_factor"]),
         },
     }
+    if phase_2_steps is not None:
+        settings["num_inference_steps2"] = int(phase_2_steps)
     if ref2va:
         settings.update({"image_refs": image_refs or None, "image_refs_relative_size": 100, "remove_background_images_ref": 0})
         for index, key in enumerate(("video_guide", "video_guide2", "video_guide3")):
@@ -421,8 +424,10 @@ def create_tab(plugin, api_session):
             use_refmods = gr.Checkbox(value=False, label="Apply the RefMods selected in Media Generator (MiniMax H3 RefMods inline panel) for this model")
             refmods_info = gr.Markdown("")
         noise_level = gr.Slider(minimum=patch.NOISE_LEVEL_MIN, maximum=1.0, step=0.01, value=DEFAULT_NOISE,
-                                label=patch.NOISE_LEVEL_LABEL, show_reset_button=False)
-        steps_info = gr.Markdown(patch.phase_2_steps_text(DEFAULT_NOISE))
+                                label=patch.noise_level_label(), show_reset_button=False)
+        phase_2_steps = gr.Slider(minimum=1, maximum=10, step=1, value=DEFAULT_PHASE_2_STEPS, label="Phase 2 Steps",
+                                  visible=patch.phase_2_steps_supported(), show_reset_button=False)
+        steps_info = gr.Markdown(patch.phase_2_steps_text(DEFAULT_NOISE, DEFAULT_PHASE_2_STEPS))
         multiplier = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, value=DEFAULT_MULTIPLIER,
                                label="Phase 2 Turbo LoRA Multiplier", show_reset_button=False)
         prompt = gr.Textbox(value=DEFAULT_PROMPT, lines=3, max_lines=12, label="Phase 2 Prompt",
@@ -461,7 +466,7 @@ def create_tab(plugin, api_session):
 
     def run_upscale(video_path, factor_value, model_type, noise_value, multiplier_value, prompt_value, seed_value,
                     fps_value, profile_value, attention_value, tiling_value, use_loras_value, window_value, overlap_value,
-                    use_refmods_value, image_refs_value, state_value, *rest):
+                    use_refmods_value, image_refs_value, phase_2_steps_value, state_value, *rest):
         # A generator, run directly by WanGP's WebUI session wrapper (it keeps the Gradio session needed to queue the task).
         config_values, reference_video_values = rest[:CONFIG_SLOTS], rest[CONFIG_SLOTS:]
         if not video_path:
@@ -487,7 +492,8 @@ def create_tab(plugin, api_session):
         settings = build_settings(source_copy, wav_path, plan, factor_value, model_type, noise_value, multiplier_value, prompt_value, seed_value,
                                   config=config, override_profile=profile_value, override_attention=attention_value, tiling=bool(tiling_value),
                                   loras=loras, loras_multipliers=loras_multipliers, window_size=window_value, overlap=overlap_value,
-                                  ref2va=ref2va, image_refs=image_refs, reference_videos=videos, refmods=refmods)
+                                  ref2va=ref2va, image_refs=image_refs, reference_videos=videos, refmods=refmods,
+                                  phase_2_steps=phase_2_steps_value if patch.phase_2_steps_supported() else None)
         print(f"{patch.LOG_PREFIX} H3 Upscaler: {plan['width']}x{plan['height']} -> {settings['resolution']} (x{plan['effective_factor']:.2f}), "
               f"{plan['frames']} frames at {plan['fps']} fps, noise level start {float(noise_value):g}, Turbo multiplier {float(multiplier_value):g}, "
               f"model {model_type}{', tiled phase 2' if tiling_value else ''}{', config ' + config if config else ''}"
@@ -542,7 +548,8 @@ def create_tab(plugin, api_session):
     plan_inputs = [source_video, factor, fps_choice, window_size, window_overlap]
     for component in plan_inputs:
         component.change(fn=_plan_text, inputs=plan_inputs, outputs=[plan_info], show_progress="hidden")
-    noise_level.change(fn=patch.phase_2_steps_text, inputs=[noise_level], outputs=[steps_info], show_progress="hidden", queue=False)
+    for component in (noise_level, phase_2_steps):
+        component.change(fn=patch.phase_2_steps_text, inputs=[noise_level, phase_2_steps], outputs=[steps_info], show_progress="hidden", queue=False)
     model.change(fn=model_changed, inputs=[model], outputs=[*config_dropdowns, override_attention, references], show_progress="hidden")
     for trigger in (model.change, refresh_loras.click, use_loras.change):
         trigger(fn=lambda state_value, model_type: _loras_text(state_value, model_type), inputs=[*state_input, model], outputs=[loras_info], show_progress="hidden")
@@ -551,6 +558,6 @@ def create_tab(plugin, api_session):
     copy_prompt.click(fn=_read_prompt, inputs=[source_video], outputs=[prompt])
     start.click(fn=run_upscale, inputs=[source_video, factor, model, noise_level, multiplier, prompt, seed,
                                         fps_choice, override_profile, override_attention, tiling, use_loras, window_size, window_overlap,
-                                        use_refmods, image_refs_gallery.gallery, *state_input, *config_dropdowns, *reference_videos],
+                                        use_refmods, image_refs_gallery.gallery, phase_2_steps, *state_input, *config_dropdowns, *reference_videos],
                 outputs=[status])
     abort.click(fn=cancel, queue=False)

@@ -271,7 +271,11 @@ def _refmod_payload(refmod_module, values):
             rows.append({"mod": mod, "strength": strength})
     if not rows:
         return None, 0
-    return json.dumps({"rows": rows, "retention": 1.0, "scramble_seed": -1, "curve": None}), len(rows)
+    payload = {"rows": rows, "retention": 1.0, "scramble_seed": -1, "curve": None}
+    if len(values) % 2 == 1:
+        # RefMods 0.36+: the panel ends with the "Video mods on sliding windows 2, 3, ..." dropdown (a one-element row)
+        payload["window_mode"] = values[-1] or getattr(refmod_module, "WINDOW_MODE_DEFAULT", "still")
+    return json.dumps(payload), len(rows)
 
 
 def _refmods_status(refmod_module, *values):

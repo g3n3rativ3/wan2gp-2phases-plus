@@ -7,6 +7,7 @@ When **Two Phases** or **Two Phases with Tiling** is selected, two controls appe
 | Control | Range | Default | Effect |
 |---|---|---|---|
 | **Phase 2 Turbo LoRA Multiplier** | 0 to 1 | 0.5 | Strength of the Turbo LoRA that WanGP adds automatically to phase 2. WanGP itself always forces it to 1.0; 0.5 is the strength recommended by that LoRA's profile. |
+| *Phase 1 resolution line* | (information) | | Shown above the Phase 2 Prompt, for example **Phase 1 resolution: 640x352** (phase 2 / output: 1280x704). Updated live whenever the resolution changes (presets, megapixels, model switch, loaded settings), without rendering. Same arithmetic as WanGP: the resolution is rounded down to a multiple of 32, and phase 1 is half of it, rounded to a multiple of 32. When the size comes from a start image (fit into canvas), the actual size can differ. |
 | **Phase 2 Prompt (optional)** | text | empty | Prompt used only by phase 2. Empty means phase 2 reuses the main prompt, which is WanGP's normal behaviour. |
 
 The plugin also extends **Phase 2 Noise Level Start** itself:

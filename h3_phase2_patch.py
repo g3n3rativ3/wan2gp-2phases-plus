@@ -421,6 +421,43 @@ def phase_2_steps_text(start, steps=None):
     return f"**Phase 2: {count} step{'s' if count > 1 else ''}** (sigmas {', '.join(f'{value:g}' for value in schedule)})"
 
 
+H3_BLOCK_SIZE = 32  # MiniMax H3 "vae_block_size": WanGP rounds the resolution down to a multiple of 32
+_DEFAULT_TWO_PHASE_SCALE = None
+
+
+def _two_phase_scale():
+    """WanGP's phase 1 -> phase 2 scale (2.0), cached by install() at startup (the H3 Upscaler tab changes the pipeline
+    value only while its own task runs)."""
+    if _DEFAULT_TWO_PHASE_SCALE is not None:
+        return _DEFAULT_TWO_PHASE_SCALE
+    return 2.0
+
+
+def phase_resolutions(resolution):
+    """((phase 1 width, height), (output width, height)) of a two-phase H3 generation for a "WxH" resolution, or None.
+    Same arithmetic as WanGP: the resolution is rounded down to a multiple of 32 (output / phase 2), then phase 1 is
+    the output divided by the two-phase scale, rounded to a multiple of 32."""
+    try:
+        width, height = (int(value) for value in str(resolution).lower().split("x")[:2])
+    except (TypeError, ValueError):
+        return None
+    width, height = width // H3_BLOCK_SIZE * H3_BLOCK_SIZE, height // H3_BLOCK_SIZE * H3_BLOCK_SIZE
+    if width <= 0 or height <= 0:
+        return None
+    scale = _two_phase_scale()
+    phase_1 = (max(H3_BLOCK_SIZE, round(width / scale / H3_BLOCK_SIZE) * H3_BLOCK_SIZE),
+               max(H3_BLOCK_SIZE, round(height / scale / H3_BLOCK_SIZE) * H3_BLOCK_SIZE))
+    return phase_1, (width, height)
+
+
+def phase_1_resolution_text(resolution):
+    sizes = phase_resolutions(resolution)
+    if sizes is None:
+        return ""
+    (width_1, height_1), (width_2, height_2) = sizes
+    return f"**Phase 1 resolution: {width_1}x{height_1}** (phase 2 / output: {width_2}x{height_2})"
+
+
 def _lower_noise_min(model_def):
     setting = model_def.get("switch_threshold") if isinstance(model_def, dict) else None
     if not isinstance(setting, dict):
@@ -515,6 +552,12 @@ def install(verbose=True):
             print(f"{LOG_PREFIX} MiniMax H3 pipeline not available, plugin inactive: {error}")
         return False
 
+    global _DEFAULT_TWO_PHASE_SCALE
+    if _DEFAULT_TWO_PHASE_SCALE is None:  # first call happens at startup, before any H3 Upscaler task changes it
+        try:
+            _DEFAULT_TWO_PHASE_SCALE = float(getattr(h3_pipeline, "H3_TWO_PHASE_SCALE", 2.0))
+        except (TypeError, ValueError):
+            _DEFAULT_TWO_PHASE_SCALE = 2.0
     pipeline_class = h3_pipeline.MiniMaxH3Pipeline
     patched = []
     if not _is_patched(pipeline_class.generate):

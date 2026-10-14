@@ -34,7 +34,7 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "2 Phases Plus"
-        self.version = "2.7.1"
+        self.version = "2.8.0"
         self.description = "MiniMax H3 Two Phases: phase 2 Turbo LoRA multiplier, phase 2 prompt, extended noise range, and an H3 Upscaler tab."
         self._ui_built = False
         self._hooks_installed = False
@@ -44,7 +44,7 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
     def setup_ui(self):
         patch.extend_noise_level_range()  # before the UI is built, so the slider starts with the extended range
         self.add_tab(tab_id="h3_upscaler", label="H3 Upscaler", component_constructor=self.create_upscaler_tab)
-        for component_id in ("state", "guidance_phases", "guidance_phases_row", "refresh_form_trigger", "model_choice_target", "switch_threshold", "num_inference_steps2"):
+        for component_id in ("state", "guidance_phases", "guidance_phases_row", "refresh_form_trigger", "model_choice_target", "switch_threshold", "num_inference_steps2", "resolution"):
             self.request_component(component_id)
 
     def post_ui_setup(self, components):
@@ -68,6 +68,8 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
         switch_threshold = components.get("switch_threshold")
         phase_2_steps = components.get("num_inference_steps2")  # WanGP 18+ "Phase 2 Steps" (absent in older versions)
         steps_inputs = [component for component in (switch_threshold, phase_2_steps) if component is not None]
+        resolution = components.get("resolution")
+        initial_resolution_text = patch.phase_1_resolution_text(resolution.value) if resolution is not None else ""
         initial_steps_text = (patch.phase_2_steps_text(switch_threshold.value, phase_2_steps.value if phase_2_steps is not None else None)
                               if switch_threshold is not None else "")
 
@@ -77,6 +79,7 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
                 multiplier = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, value=patch.DEFAULT_MULTIPLIER,
                                        label="Phase 2 Turbo LoRA Multiplier", info=MULTIPLIER_INFO,
                                        show_reset_button=False, elem_id="two_phases_plus_multiplier")
+                resolution_info = gr.Markdown(initial_resolution_text, visible=resolution is not None, elem_id="two_phases_plus_resolution")
                 phase2_prompt = gr.Textbox(value="", lines=3, max_lines=12, label="Phase 2 Prompt (optional)",
                                            placeholder=PROMPT_PLACEHOLDER, elem_id="two_phases_plus_prompt")
 
@@ -93,6 +96,9 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
                 for component in steps_inputs:
                     component.change(fn=patch.phase_2_steps_text, inputs=steps_inputs, outputs=[steps_info],
                                      show_progress="hidden", queue=False)
+            if resolution is not None:  # any resolution change (presets, megapixels, model switch, loaded settings), no render needed
+                resolution.change(fn=patch.phase_1_resolution_text, inputs=[resolution], outputs=[resolution_info],
+                                  show_progress="hidden", queue=False)
             if refresh_form_trigger is not None:  # settings loaded from a video, an image or a settings file
                 refresh_form_trigger.change(fn=self._load_from_settings, inputs=[state_component],
                                             outputs=[multiplier, phase2_prompt, controls], show_progress="hidden")

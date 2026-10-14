@@ -25,6 +25,9 @@ HOOK_MARKER = "_two_phases_plus_hook"
 
 MULTIPLIER_INFO = ("Strength of the Turbo LoRA that WanGP adds automatically to phase 2 (WanGP default: 1.0). "
                    "Lower values let phase 2 stay closer to phase 1; very low values may give a blurry result with only 3 steps.")
+PHASE_1_SCALE_CHOICES = [("Output / 2 (WanGP default)", 2.0), ("Output / 1.5", 1.5)]
+PHASE_1_SCALE_INFO = ("Phase 1 is rendered at the output resolution divided by this value, then enlarged by the latent upscaler for phase 2. "
+                      "/ 1.5 gives phase 1 more detail (larger phase 1, slower and more VRAM in phase 1).")
 PROMPT_PLACEHOLDER = ("Empty = phase 2 reuses the main prompt. Write a phase 2 specific prompt here, "
                       "for example a short description without the elements phase 2 should not amplify. "
                       "{prompt} is replaced by the main prompt.")
@@ -34,7 +37,7 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "2 Phases Plus"
-        self.version = "2.8.0"
+        self.version = "2.9.0"
         self.description = "MiniMax H3 Two Phases: phase 2 Turbo LoRA multiplier, phase 2 prompt, extended noise range, and an H3 Upscaler tab."
         self._ui_built = False
         self._hooks_installed = False
@@ -79,14 +82,15 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
                 multiplier = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, value=patch.DEFAULT_MULTIPLIER,
                                        label="Phase 2 Turbo LoRA Multiplier", info=MULTIPLIER_INFO,
                                        show_reset_button=False, elem_id="two_phases_plus_multiplier")
+                phase_1_scale = gr.Radio(choices=PHASE_1_SCALE_CHOICES, value=patch.PHASE_1_SCALE_DEFAULT, label="Phase 1 Resolution",
+                                         info=PHASE_1_SCALE_INFO, elem_id="two_phases_plus_phase1_scale")
                 resolution_info = gr.Markdown(initial_resolution_text, visible=resolution is not None, elem_id="two_phases_plus_resolution")
                 phase2_prompt = gr.Textbox(value="", lines=3, max_lines=12, label="Phase 2 Prompt (optional)",
                                            placeholder=PROMPT_PLACEHOLDER, elem_id="two_phases_plus_prompt")
 
-            multiplier.change(fn=self._store_values, inputs=[state_component, multiplier, phase2_prompt], outputs=None,
-                              show_progress="hidden", queue=False)
-            phase2_prompt.change(fn=self._store_values, inputs=[state_component, multiplier, phase2_prompt], outputs=None,
-                                 show_progress="hidden", queue=False)
+            value_inputs = [state_component, multiplier, phase2_prompt, phase_1_scale]
+            for component in (multiplier, phase2_prompt, phase_1_scale):
+                component.change(fn=self._store_values, inputs=value_inputs, outputs=None, show_progress="hidden", queue=False)
             guidance_phases.change(fn=self._visibility_from_state, inputs=[state_component, guidance_phases], outputs=[controls],
                                    show_progress="hidden")
             if model_choice_target is not None:
@@ -97,11 +101,12 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
                     component.change(fn=patch.phase_2_steps_text, inputs=steps_inputs, outputs=[steps_info],
                                      show_progress="hidden", queue=False)
             if resolution is not None:  # any resolution change (presets, megapixels, model switch, loaded settings), no render needed
-                resolution.change(fn=patch.phase_1_resolution_text, inputs=[resolution], outputs=[resolution_info],
-                                  show_progress="hidden", queue=False)
+                for component in (resolution, phase_1_scale):
+                    component.change(fn=patch.phase_1_resolution_text, inputs=[resolution, phase_1_scale], outputs=[resolution_info],
+                                     show_progress="hidden", queue=False)
             if refresh_form_trigger is not None:  # settings loaded from a video, an image or a settings file
                 refresh_form_trigger.change(fn=self._load_from_settings, inputs=[state_component],
-                                            outputs=[multiplier, phase2_prompt, controls], show_progress="hidden")
+                                            outputs=[multiplier, phase2_prompt, phase_1_scale, controls], show_progress="hidden")
             return controls
 
         self.insert_after("guidance_phases_row", build_controls)
@@ -234,12 +239,14 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
         values = state.get(UI_STATE_KEY) if isinstance(state, dict) else None
         values = values if isinstance(values, dict) else {}
         return {patch.MULTIPLIER_KEY: patch.parse_multiplier(values.get(patch.MULTIPLIER_KEY, patch.DEFAULT_MULTIPLIER)),
-                patch.PROMPT_KEY: patch.parse_prompt(values.get(patch.PROMPT_KEY, ""))}
+                patch.PROMPT_KEY: patch.parse_prompt(values.get(patch.PROMPT_KEY, "")),
+                patch.PHASE_1_SCALE_KEY: patch.parse_phase_1_scale(values.get(patch.PHASE_1_SCALE_KEY, patch.PHASE_1_SCALE_DEFAULT))}
 
     # ------------------------------------------------------------- events
-    def _store_values(self, state, multiplier, phase2_prompt):
+    def _store_values(self, state, multiplier, phase2_prompt, phase_1_scale=None):
         values = {patch.MULTIPLIER_KEY: patch.parse_multiplier(multiplier),
-                  patch.PROMPT_KEY: phase2_prompt if isinstance(phase2_prompt, str) else ""}
+                  patch.PROMPT_KEY: phase2_prompt if isinstance(phase2_prompt, str) else "",
+                  patch.PHASE_1_SCALE_KEY: patch.parse_phase_1_scale(phase_1_scale)}
         patch.UI_VALUES.update(values)
         if isinstance(state, dict):
             state[UI_STATE_KEY] = values
@@ -258,15 +265,16 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
 
     def _load_from_settings(self, state):
         if not isinstance(state, dict):
-            return gr.update(), gr.update(), gr.update()
+            return gr.update(), gr.update(), gr.update(), gr.update()
         model_type = self._call("get_state_model_type", state)
         settings = self._call("get_model_settings", state, model_type) or {}
         custom_settings = settings.get("custom_settings") if isinstance(settings, dict) else None
         visible = gr.update(visible=self._controls_visible(model_type, settings.get("guidance_phases") if isinstance(settings, dict) else None))
         if not isinstance(custom_settings, dict) or not any(key in custom_settings for key in patch.SETTING_KEYS):
-            return gr.update(), gr.update(), visible
+            return gr.update(), gr.update(), gr.update(), visible
         multiplier = patch.parse_multiplier(custom_settings.get(patch.MULTIPLIER_KEY, patch.DEFAULT_MULTIPLIER))
         phase2_prompt = patch.parse_prompt(custom_settings.get(patch.PROMPT_KEY, ""))
-        state[UI_STATE_KEY] = {patch.MULTIPLIER_KEY: multiplier, patch.PROMPT_KEY: phase2_prompt}
+        phase_1_scale = patch.parse_phase_1_scale(custom_settings.get(patch.PHASE_1_SCALE_KEY, patch.PHASE_1_SCALE_DEFAULT))
+        state[UI_STATE_KEY] = {patch.MULTIPLIER_KEY: multiplier, patch.PROMPT_KEY: phase2_prompt, patch.PHASE_1_SCALE_KEY: phase_1_scale}
         patch.UI_VALUES.update(state[UI_STATE_KEY])
-        return gr.update(value=multiplier), gr.update(value=phase2_prompt), visible
+        return gr.update(value=multiplier), gr.update(value=phase2_prompt), gr.update(value=phase_1_scale), visible

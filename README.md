@@ -2,12 +2,13 @@
 
 Extra phase 2 controls for **MiniMax H3** two-phase generation in WanGP, and an **H3 Upscaler** tab that runs H3's phase 2 on an existing video.
 
-When **Two Phases** or **Two Phases with Tiling** is selected, two controls appear right below **Phase 2 Noise Level Start**:
+When **Two Phases** or **Two Phases with Tiling** is selected, the plugin's controls appear right below **Phase 2 Noise Level Start**:
 
 | Control | Range | Default | Effect |
 |---|---|---|---|
 | **Phase 2 Turbo LoRA Multiplier** | 0 to 1 | 0.5 | Strength of the Turbo LoRA that WanGP adds automatically to phase 2. WanGP itself always forces it to 1.0; 0.5 is the strength recommended by that LoRA's profile. |
-| *Phase 1 resolution line* | (information) | | Shown above the Phase 2 Prompt, for example **Phase 1 resolution: 640x352** (phase 2 / output: 1280x704). Updated live whenever the resolution changes (presets, megapixels, model switch, loaded settings), without rendering. Same arithmetic as WanGP: the resolution is rounded down to a multiple of 32, and phase 1 is half of it, rounded to a multiple of 32. When the size comes from a start image (fit into canvas), the actual size can differ. |
+| **Phase 1 Resolution** | Output / 2, Output / 1.5 | Output / 2 | Size of phase 1 relative to the output (phase 2). **Output / 2** is WanGP's own behaviour. **Output / 1.5** renders phase 1 larger (more detail kept from phase 1, slower and more VRAM in phase 1), and the latent upscaler then enlarges it x1.5 instead of x2 (same as the H3 Upscaler tab's x1.5). Saved with the settings and in the video metadata; older settings without it use Output / 2. |
+| *Phase 1 resolution line* | (information) | | Shown below the option, for example **Phase 1 resolution: 640x352** (phase 2 / output: 1280x704), or 864x480 with Output / 1.5. Updated live whenever the resolution or the option changes (presets, megapixels, model switch, loaded settings), without rendering. Same arithmetic as WanGP: the resolution is rounded down to a multiple of 32, and phase 1 is the output divided by 2 (or 1.5), rounded to a multiple of 32. When the size comes from a start image (fit into canvas), the actual size can differ. |
 | **Phase 2 Prompt (optional)** | text | empty | Prompt used only by phase 2. Empty means phase 2 reuses the main prompt, which is WanGP's normal behaviour. |
 
 The plugin also extends **Phase 2 Noise Level Start** itself:

@@ -21,7 +21,10 @@ import threading
 
 MULTIPLIER_KEY = "two_phases_plus_turbo_multiplier"
 PROMPT_KEY = "two_phases_plus_phase2_prompt"
-SETTING_KEYS = (MULTIPLIER_KEY, PROMPT_KEY)
+PHASE_1_SCALE_KEY = "two_phases_plus_phase1_scale"  # Media Generator: phase 2 (output) size / phase 1 size
+SETTING_KEYS = (MULTIPLIER_KEY, PROMPT_KEY, PHASE_1_SCALE_KEY)
+PHASE_1_SCALE_DEFAULT = 2.0  # WanGP's own two-phase scale: phase 1 at half the output size
+PHASE_1_SCALE_CHOICES = (2.0, 1.5)
 # H3 Upscaler tab: the source video replaces phase 1, and the phase 1 -> phase 2 scale is the chosen factor
 UPSCALE_SOURCE_KEY = "two_phases_plus_upscale_source"
 UPSCALE_FACTOR_KEY = "two_phases_plus_upscale_factor"
@@ -67,7 +70,7 @@ _state = threading.local()
 _installed = False
 # Last values set in the UI controls. Used when a task does not carry the values in its custom_settings
 # (for instance when another plugin replaced WanGP's settings functions after this plugin hooked them).
-UI_VALUES = {MULTIPLIER_KEY: DEFAULT_MULTIPLIER, PROMPT_KEY: ""}
+UI_VALUES = {MULTIPLIER_KEY: DEFAULT_MULTIPLIER, PROMPT_KEY: "", PHASE_1_SCALE_KEY: PHASE_1_SCALE_DEFAULT}
 
 
 def _current():
@@ -80,6 +83,14 @@ def parse_multiplier(value):
     except (TypeError, ValueError):
         return DEFAULT_MULTIPLIER
     return min(1.0, max(0.0, multiplier))
+
+
+def parse_phase_1_scale(value):
+    try:
+        scale = float(value)
+    except (TypeError, ValueError):
+        return PHASE_1_SCALE_DEFAULT
+    return scale if scale in PHASE_1_SCALE_CHOICES else PHASE_1_SCALE_DEFAULT
 
 
 def parse_prompt(value):
@@ -116,13 +127,14 @@ def _make_generate(original_generate):
         source = custom_settings if from_task else UI_VALUES
         multiplier = parse_multiplier(source.get(MULTIPLIER_KEY, DEFAULT_MULTIPLIER))
         phase2_prompt = parse_prompt(source.get(PROMPT_KEY, ""))
+        phase_1_scale = parse_phase_1_scale(source.get(PHASE_1_SCALE_KEY, PHASE_1_SCALE_DEFAULT))
         try:
             two_phase = int(str(kwargs.get("guide_phases", 1)).strip("~") or 1) > 1
         except ValueError:
             two_phase = False
         if two_phase:
             print(f"{LOG_PREFIX} values {'from the task settings' if from_task else 'from the UI controls'}: "
-                  f"phase 2 Turbo LoRA multiplier {multiplier:g}, phase 2 prompt {'set (' + str(len(phase2_prompt)) + ' characters)' if phase2_prompt else 'empty'}")
+                  f"phase 1 at output / {phase_1_scale:g}, phase 2 Turbo LoRA multiplier {multiplier:g}, phase 2 prompt {'set (' + str(len(phase2_prompt)) + ' characters)' if phase2_prompt else 'empty'}")
         schedule_override = None
         if two_phase:
             schedule_override = _phase_2_schedule_for(kwargs.get("switch_threshold"), kwargs.get("sampling_steps2"))
@@ -141,8 +153,12 @@ def _make_generate(original_generate):
         original_schedule = getattr(h3_pipeline, "H3_PHASE_2_SIGMAS", None) if h3_pipeline is not None else None
         upscale_source = custom_settings.get(UPSCALE_SOURCE_KEY) if two_phase else None
         original_scale = getattr(h3_pipeline, "H3_TWO_PHASE_SCALE", None) if h3_pipeline is not None else None
+        scale_changed = False
         restore_forward = None
         try:
+            if two_phase and not upscale_source and original_scale is not None and phase_1_scale != float(original_scale):
+                h3_pipeline.H3_TWO_PHASE_SCALE = phase_1_scale  # Media Generator option: phase 1 at output / 1.5 instead of / 2
+                scale_changed = True
             if upscale_source:
                 factor = float(custom_settings.get(UPSCALE_FACTOR_KEY, 2.0) or 2.0)
                 h3_pipeline.H3_TWO_PHASE_SCALE = factor
@@ -163,7 +179,7 @@ def _make_generate(original_generate):
         finally:
             if restore_forward is not None:
                 restore_forward()
-            if upscale_source and original_scale is not None:
+            if (upscale_source or scale_changed) and original_scale is not None:
                 h3_pipeline.H3_TWO_PHASE_SCALE = original_scale
             if schedule_override is not None and original_schedule is not None:
                 h3_pipeline.H3_PHASE_2_SIGMAS = original_schedule
@@ -422,18 +438,9 @@ def phase_2_steps_text(start, steps=None):
 
 
 H3_BLOCK_SIZE = 32  # MiniMax H3 "vae_block_size": WanGP rounds the resolution down to a multiple of 32
-_DEFAULT_TWO_PHASE_SCALE = None
 
 
-def _two_phase_scale():
-    """WanGP's phase 1 -> phase 2 scale (2.0), cached by install() at startup (the H3 Upscaler tab changes the pipeline
-    value only while its own task runs)."""
-    if _DEFAULT_TWO_PHASE_SCALE is not None:
-        return _DEFAULT_TWO_PHASE_SCALE
-    return 2.0
-
-
-def phase_resolutions(resolution):
+def phase_resolutions(resolution, scale=PHASE_1_SCALE_DEFAULT):
     """((phase 1 width, height), (output width, height)) of a two-phase H3 generation for a "WxH" resolution, or None.
     Same arithmetic as WanGP: the resolution is rounded down to a multiple of 32 (output / phase 2), then phase 1 is
     the output divided by the two-phase scale, rounded to a multiple of 32."""
@@ -444,14 +451,14 @@ def phase_resolutions(resolution):
     width, height = width // H3_BLOCK_SIZE * H3_BLOCK_SIZE, height // H3_BLOCK_SIZE * H3_BLOCK_SIZE
     if width <= 0 or height <= 0:
         return None
-    scale = _two_phase_scale()
+    scale = parse_phase_1_scale(scale)
     phase_1 = (max(H3_BLOCK_SIZE, round(width / scale / H3_BLOCK_SIZE) * H3_BLOCK_SIZE),
                max(H3_BLOCK_SIZE, round(height / scale / H3_BLOCK_SIZE) * H3_BLOCK_SIZE))
     return phase_1, (width, height)
 
 
-def phase_1_resolution_text(resolution):
-    sizes = phase_resolutions(resolution)
+def phase_1_resolution_text(resolution, scale=PHASE_1_SCALE_DEFAULT):
+    sizes = phase_resolutions(resolution, scale)
     if sizes is None:
         return ""
     (width_1, height_1), (width_2, height_2) = sizes
@@ -552,12 +559,6 @@ def install(verbose=True):
             print(f"{LOG_PREFIX} MiniMax H3 pipeline not available, plugin inactive: {error}")
         return False
 
-    global _DEFAULT_TWO_PHASE_SCALE
-    if _DEFAULT_TWO_PHASE_SCALE is None:  # first call happens at startup, before any H3 Upscaler task changes it
-        try:
-            _DEFAULT_TWO_PHASE_SCALE = float(getattr(h3_pipeline, "H3_TWO_PHASE_SCALE", 2.0))
-        except (TypeError, ValueError):
-            _DEFAULT_TWO_PHASE_SCALE = 2.0
     pipeline_class = h3_pipeline.MiniMaxH3Pipeline
     patched = []
     if not _is_patched(pipeline_class.generate):

@@ -37,7 +37,7 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "2 Phases Plus"
-        self.version = "2.9.0"
+        self.version = "2.12.0"
         self.description = "MiniMax H3 Two Phases: phase 2 Turbo LoRA multiplier, phase 2 prompt, extended noise range, and an H3 Upscaler tab."
         self._ui_built = False
         self._hooks_installed = False

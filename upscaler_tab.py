@@ -33,7 +33,9 @@ DEFAULT_PROMPT = "."
 FPS = 24  # MiniMax H3 default frame rate
 FPS_CHOICES = [(f"Model Default ({FPS} fps)", ""), ("Source Video fps", "source")] + [(value, value) for value in ("15", "16", "23", "24", "25", "30", "48", "50")]
 FRAMES_MIN, FRAMES_STEP, FRAMES_OFFSET = 107, 17, 5  # MiniMax H3: 107 frames minimum, then 5 + 17n
-FRAMES_MAX = 737  # longest video processed (about 30 s at 24 fps), split into sliding windows when longer than the window size
+MAX_SECONDS = 600  # longest video processed (10 minutes), split into sliding windows: VRAM stays at the level of one window
+RAM_BYTES_PER_PIXEL = 3  # WanGP keeps every output frame in RAM (uint8 RGB) until the video is saved
+RAM_WARNING_SHARE = 0.6  # warn when the frames alone need more than this share of the system RAM (the models need RAM too)
 WINDOW_MIN, WINDOW_MAX, WINDOW_STEP, WINDOW_DEFAULT = 124, 481, 17, 481  # H3 FL2VA sliding window sizes
 OVERLAP_MIN, OVERLAP_MAX, OVERLAP_STEP, OVERLAP_DEFAULT = 1, 120, 17, 18
 SIZE_ALIGNMENT = 32
@@ -44,8 +46,8 @@ WORK_DIR = os.path.join(tempfile.gettempdir(), "wan2gp_h3_upscaler")
 
 INTRO = ("Runs MiniMax H3's **phase 2** on an existing video: the video is encoded at its own resolution, enlarged by the "
          "H3 latent upscaler and refined by phase 2 at the target resolution. The soundtrack of the video is kept. "
-         "Videos are processed at 24 fps by default, from 107 frames (4.5 s at 24 fps) up to 737 frames (about 30 s, in sliding windows "
-         "beyond the window size), "
+         f"Videos are processed at 24 fps by default, from 107 frames (4.5 s at 24 fps) up to {MAX_SECONDS // 60} minutes, in sliding windows "
+         "beyond the window size (VRAM stays at the level of one window; RAM grows with the length, see the estimate below the video), "
          f"and the output is limited to {MAX_OUTPUT_SIZE} pixels on its longest side.")
 
 
@@ -88,8 +90,38 @@ def _resolve_fps(fps_choice, metadata):
     return FPS, ""
 
 
-def _usable_frames(frames_24):
-    frames = min(frames_24, FRAMES_MAX)
+def _frames_max(fps):
+    """Longest H3 length (5 + 17n frames) within MAX_SECONDS at this frame rate."""
+    frames = int(MAX_SECONDS * float(fps or FPS))
+    return max(FRAMES_MIN, (frames - FRAMES_OFFSET) // FRAMES_STEP * FRAMES_STEP + FRAMES_OFFSET)
+
+
+def _system_ram_bytes():
+    try:
+        import psutil
+        return int(psutil.virtual_memory().total)
+    except Exception:
+        try:
+            return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+        except Exception:
+            return 0
+
+
+def _ram_estimate_text(frames, width, height):
+    """RAM used by the output frames, which WanGP keeps in memory until the video is saved."""
+    needed = frames * width * height * RAM_BYTES_PER_PIXEL
+    total = _system_ram_bytes()
+    text = f"**RAM for the output frames:** about {needed / 1024 ** 3:.1f} GB"
+    if total > 0:
+        text += f" (system RAM: {total / 1024 ** 3:.0f} GB)"
+        if needed > total * RAM_WARNING_SHARE:
+            text = (f"⚠️ {text}: more than {int(RAM_WARNING_SHARE * 100)} % of the system RAM, which WanGP also needs for the models. "
+                    "The upscale may fail: use a lower factor or a shorter video.")
+    return text
+
+
+def _usable_frames(frames_24, fps=FPS):
+    frames = min(frames_24, _frames_max(fps))
     if frames < FRAMES_MIN:
         return 0
     return (frames - FRAMES_OFFSET) // FRAMES_STEP * FRAMES_STEP + FRAMES_OFFSET
@@ -114,7 +146,7 @@ def _plan(path, factor, fps_choice=""):
     width, height = int(metadata.get("display_width") or metadata.get("width")), int(metadata.get("display_height") or metadata.get("height"))
     fps, force_fps = _resolve_fps(fps_choice, metadata)
     frames_available = _frames_at_fps(metadata, fps)
-    frames = _usable_frames(frames_available)
+    frames = _usable_frames(frames_available, fps)
     if max(_aligned(width), _aligned(height)) > MAX_OUTPUT_SIZE:
         raise gr.Error(f"The video is larger than {MAX_OUTPUT_SIZE} pixels: it cannot be processed.")
     target_width, target_height, effective_factor = _target_size(width, height, factor)
@@ -150,8 +182,12 @@ def _plan_text(path, factor, fps_choice="", window_size=WINDOW_DEFAULT, overlap=
         lines[1] += ", 1 window" if windows == 1 else f", about {windows} sliding windows of {int(window_size)} frames (overlap {int(overlap)})"
         if plan["frames"] < plan["frames_available"]:
             dropped = plan["frames_available"] - plan["frames"]
-            reason = f"the maximum is {FRAMES_MAX} frames" if plan["frames_available"] > FRAMES_MAX else "H3 lengths are 5 + 17n frames"
+            frames_max = _frames_max(fps)
+            reason = (f"the maximum is {frames_max} frames ({MAX_SECONDS // 60} minutes)" if plan["frames_available"] > frames_max
+                      else "H3 lengths are 5 + 17n frames")
             lines.append(f"The last {dropped} frame(s) ({dropped / fps:.2f} s) are not processed: {reason}.")
+    if plan["frames"] > 0:
+        lines.append(_ram_estimate_text(plan["frames"], plan["target_width"], plan["target_height"]))
     return "<br>".join(lines)
 
 
@@ -239,21 +275,135 @@ REFMOD_PLUGIN_ID = "H3RefMods"  # PlugIn_Id of the MiniMax H3 RefMods plugin
 REFMOD_PLUGIN_CLASS = "MiniMaxH3RefModsPlugin"
 
 
-def _refmod_plugin_module():
-    """The plugin module of the MiniMax H3 RefMods plugin when it is enabled (WanGP only imports enabled plugins), else None."""
+def _enabled_plugin_module(matches):
+    """The plugin module (its plugin.py) of an enabled plugin for which matches(module) is true, else None.
+    WanGP only imports the plugin.py of enabled plugins; the enabled list of the WanGP config is checked too."""
     import sys
     enabled = None
     wgp = _wgp()
     if wgp is not None and isinstance(getattr(wgp, "server_config", None), dict):
         enabled = set(wgp.server_config.get("enabled_plugins") or [])
     for name, module in list(sys.modules.items()):
-        if module is None or getattr(module, "PlugIn_Id", None) != REFMOD_PLUGIN_ID or not hasattr(module, REFMOD_PLUGIN_CLASS):
+        try:
+            if module is None or not matches(module):
+                continue
+        except Exception:
             continue
         package = name.rsplit(".", 1)[0] if "." in name else name
         if enabled is not None and package not in enabled and name not in enabled:
             continue
         return module
     return None
+
+
+def _refmod_plugin_module():
+    """The plugin module of the MiniMax H3 RefMods plugin when it is enabled, else None."""
+    return _enabled_plugin_module(lambda module: getattr(module, "PlugIn_Id", None) == REFMOD_PLUGIN_ID and hasattr(module, REFMOD_PLUGIN_CLASS))
+
+
+MULTIGPU_PLUGIN_CLASS = "MultiGPUPlugin"
+MULTIGPU_PLUGIN_NAME = "Multi-GPU"
+# Labels of the Multi-GPU tab controls -> keys of that plugin's saved settings (used to show the current values when the tab is opened)
+MULTIGPU_LABEL_KEYS = {
+    "Enable multi-GPU": "enabled",
+    "Split H3 denoising across cuda:0 and cuda:1": "denoise_enabled",
+    "Denoising work share of cuda:0 (%)": "denoise_share_cuda0",
+    "Also split still images (Text to Image)": "denoise_images",
+    "Attention heads per exchanged chunk": "denoise_chunk_heads",
+    "Split H3 VAE decoding across cuda:0 and cuda:1": "vae_enabled",
+    "Work share of cuda:0 (%)": "share_cuda0",
+    "Keep the last text encoder layers on cuda:1 (ignored while denoising is split)": "te_enabled",
+    "Text encoder layers kept on cuda:1": "te_layers_cuda1",
+}
+
+
+def _multigpu_plugin_module():
+    """The plugin module of the Multi-GPU plugin when it is enabled, else None."""
+    return _enabled_plugin_module(lambda module: getattr(module, "PLUGIN_NAME", None) == MULTIGPU_PLUGIN_NAME
+                                  and callable(getattr(getattr(module, MULTIGPU_PLUGIN_CLASS, None), "_build_tab", None)))
+
+
+def _multigpu_settings(multigpu_module):
+    """The settings module of the Multi-GPU plugin (shared by its Media Generator tab and the copy in this tab), or None."""
+    import sys
+    package = multigpu_module.__name__.rsplit(".", 1)[0]
+    settings = sys.modules.get(f"{package}.settings")
+    return settings if callable(getattr(settings, "get", None)) else None
+
+
+LATENT_PLUGIN_CLASS = "H3LatentPlugin"
+LATENT_TASK_KEY = "_h3_latent_task_options_v1"  # H3 Latent Continue: per-task options (moved into the task's plugin_data by that plugin)
+LATENT_SAVE_LABEL = "Save latent checkpoint next to output video"
+
+
+def _latent_plugin_module():
+    """The plugin module of the H3 Latent Continue plugin when it is enabled, else None."""
+    return _enabled_plugin_module(lambda module: hasattr(module, LATENT_PLUGIN_CLASS) and callable(getattr(module, "make_generation_wrapper", None)))
+
+
+def _latent_task_key(latent_module):
+    import sys
+    package = latent_module.__name__.rsplit(".", 1)[0]
+    integration = sys.modules.get(f"{package}.integration")
+    return getattr(integration, "TASK_KEY", LATENT_TASK_KEY)
+
+
+def _allow_upscale_soundtrack(latent_module):
+    """H3 Latent Continue rejects the Ref2VA 'kept soundtrack' audio mode ("S"), but accepts FL2VA's "A", which the H3
+    pipeline handles exactly the same way (the target audio is conditioned on the encoded soundtrack). Ref2VA upscales
+    need "AS" ("A" alone is a voice reference in Ref2VA), so the check is relaxed for H3 Upscaler tasks only."""
+    import sys
+    package = latent_module.__name__.rsplit(".", 1)[0]
+    integration = sys.modules.get(f"{package}.integration")
+    original = getattr(integration, "preflight", None)
+    if not callable(original) or getattr(original, "_two_phases_plus_upscale", False):
+        return
+
+    def preflight(params, opts):
+        custom_settings = params.get("custom_settings") if isinstance(params, dict) else None
+        audio_prompt_type = str(params.get("audio_prompt_type") or "") if isinstance(params, dict) else ""
+        if isinstance(custom_settings, dict) and custom_settings.get(patch.UPSCALE_SOURCE_KEY) and "S" in audio_prompt_type:
+            params = dict(params, audio_prompt_type=audio_prompt_type.replace("S", ""))  # same pipeline path as FL2VA "A"
+        return original(params, opts)
+
+    preflight._two_phases_plus_upscale = True
+    preflight.__wrapped__ = original
+    integration.preflight = preflight
+
+
+def _latent_save_problem(ref2va, tiling, frames, window_size):
+    """Why H3 Latent Continue cannot save a checkpoint for this upscale (its own limits), or None."""
+    if tiling:
+        return "H3 Latent Continue does not support Phase 2 with Tiling: uncheck it in Advanced > Misc."
+    if frames > int(window_size):
+        return (f"H3 Latent Continue saves one generated window per job: this video needs {frames} frames, more than the sliding window "
+                f"size ({int(window_size)}). Shorten the video or raise Sliding Window Size (maximum {WINDOW_MAX}).")
+    return None
+
+
+def _component_tree(block):
+    for child in getattr(block, "children", None) or []:
+        yield child
+        yield from _component_tree(child)
+
+
+def _build_multigpu_tab(multigpu_module):
+    """Add the Multi-GPU plugin's own tab (same controls, same saved settings) and refresh its values each time it is
+    opened, since the same settings can also be changed from the Media Generator tab."""
+    try:
+        tab = getattr(multigpu_module, MULTIGPU_PLUGIN_CLASS)._build_tab(None)
+    except Exception as error:
+        print(f"{patch.LOG_PREFIX} H3 Upscaler: could not build the Multi-GPU tab: {error!r}")
+        return None
+    settings = _multigpu_settings(multigpu_module)
+    controls = [(component, MULTIGPU_LABEL_KEYS[component.label]) for component in _component_tree(tab)
+                if isinstance(getattr(component, "label", None), str) and component.label in MULTIGPU_LABEL_KEYS]
+    if settings is not None and controls and hasattr(tab, "select"):
+        def current_values():
+            values = settings.get()
+            return [gr.update(value=values[key]) if key in values else gr.update() for _, key in controls]
+        tab.select(fn=current_values, inputs=None, outputs=[component for component, _ in controls], show_progress="hidden", queue=False)
+    return tab
 
 
 def _refmod_payload(refmod_module, values):
@@ -417,6 +567,8 @@ def create_tab(plugin, api_session):
 
     active_job = {"job": None}
     refmod_module = _refmod_plugin_module()
+    multigpu_module = _multigpu_plugin_module()
+    latent_module = _latent_plugin_module()
     model_choices = _model_choices()
     default_model = model_choices[0][1] if model_choices else None
     state_component = getattr(plugin, "state", None)
@@ -493,13 +645,18 @@ def create_tab(plugin, api_session):
                     override_profile = gr.Dropdown(choices=_profile_choices(), value=-1, label="Override Memory Profile")
                     override_attention = gr.Dropdown(choices=_attention_choices(default_model), value="", label="Override Attention Mode")
                     tiling = gr.Checkbox(value=False, label="Phase 2 with Tiling (lower peak VRAM for large outputs, possible seams)")
+                if multigpu_module is not None:  # Multi-GPU plugin enabled: its own tab, sharing its settings with Media Generator
+                    _build_multigpu_tab(multigpu_module)
+        save_latent = gr.Checkbox(value=False, label=LATENT_SAVE_LABEL, visible=latent_module is not None,
+                                  info="H3 Latent Continue plugin: saves the latents of the upscaled video (.safetensors, same name as the video) "
+                                       "so it can be continued with latents in Media Generator. One window, untiled phase 2.")
         with gr.Row():
             start = gr.Button("Upscale", variant="primary")
             abort = gr.Button("Abort")
 
     def run_upscale(video_path, factor_value, model_type, noise_value, multiplier_value, prompt_value, seed_value,
                     fps_value, profile_value, attention_value, tiling_value, use_loras_value, window_value, overlap_value,
-                    image_refs_value, phase_2_steps_value, state_value, *rest):
+                    image_refs_value, phase_2_steps_value, save_latent_value, state_value, *rest):
         # A generator, run directly by WanGP's WebUI session wrapper (it keeps the Gradio session needed to queue the task).
         config_values = rest[:CONFIG_SLOTS]
         reference_video_values = rest[CONFIG_SLOTS:CONFIG_SLOTS + REFERENCE_VIDEO_SLOTS]
@@ -513,6 +670,11 @@ def create_tab(plugin, api_session):
         plan = _plan(video_path, factor_value, fps_value)
         if plan["frames"] == 0:
             raise gr.Error(f"The video is too short: MiniMax H3 needs at least {FRAMES_MIN} frames ({FRAMES_MIN / plan['fps']:.2f} s at {plan['fps']} fps).")
+        save_latent_value = bool(save_latent_value) and latent_module is not None
+        if save_latent_value:
+            problem = _latent_save_problem(ref2va, bool(tiling_value), plan["frames"], window_value)
+            if problem:
+                raise gr.Error(problem)
         plugin.ensure_hooks()
         patch.install(verbose=False)
         yield "Preparing the source video and its soundtrack..."
@@ -529,11 +691,19 @@ def create_tab(plugin, api_session):
                                   loras=loras, loras_multipliers=loras_multipliers, window_size=window_value, overlap=overlap_value,
                                   ref2va=ref2va, image_refs=image_refs, reference_videos=videos, refmods=refmods,
                                   phase_2_steps=phase_2_steps_value if patch.phase_2_steps_supported() else None)
+        if save_latent_value:
+            if ref2va:
+                _allow_upscale_soundtrack(latent_module)
+            settings[_latent_task_key(latent_module)] = {"model_type": model_type,
+                                                         "options": {"save": True, "continue": False, "latent_path": "", "join_mode": "baseline"}}
+            settings.update({"film_grain_intensity": 0, "sliding_window_discard_last_frames": 0, "sliding_window_trim_first_frames": 0,
+                             "sliding_window_color_correction_strength": 0})
         print(f"{patch.LOG_PREFIX} H3 Upscaler: {plan['width']}x{plan['height']} -> {settings['resolution']} (x{plan['effective_factor']:.2f}), "
               f"{plan['frames']} frames at {plan['fps']} fps, noise level start {float(noise_value):g}, Turbo multiplier {float(multiplier_value):g}, "
               f"model {model_type}{', tiled phase 2' if tiling_value else ''}{', config ' + config if config else ''}"
               f", sliding window {int(window_value)}/{int(overlap_value)}{', LoRAs ' + str(len(loras)) if loras else ''}"
-              + (f", {len(image_refs)} reference image(s), {len(videos)} reference video(s){', RefMods' if refmods else ''}" if ref2va else ""))
+              + (f", {len(image_refs)} reference image(s), {len(videos)} reference video(s){', RefMods' if refmods else ''}" if ref2va else "")
+              + (", latent checkpoint saved (H3 Latent Continue)" if save_latent_value else ""))
 
         progress_state = {"text": "Queued in WanGP...", "changed": True}
 
@@ -563,7 +733,10 @@ def create_tab(plugin, api_session):
             if active_job.get("job") is job:
                 active_job["job"] = None
         if result.success and result.generated_files:
-            yield f"✅ Done: `{result.generated_files[0]}` (also in the Media Generator gallery)."
+            output = str(result.generated_files[0])
+            checkpoint = os.path.splitext(output)[0] + ".safetensors"
+            latent_note = f" Latent checkpoint: `{checkpoint}`." if save_latent_value and os.path.isfile(checkpoint) else ""
+            yield f"✅ Done: `{output}` (also in the Media Generator gallery).{latent_note}"
             return
         if result.cancelled:
             yield "Aborted."
@@ -597,6 +770,6 @@ def create_tab(plugin, api_session):
     copy_prompt.click(fn=_read_prompt, inputs=[source_video], outputs=[prompt])
     start.click(fn=run_upscale, inputs=[source_video, factor, model, noise_level, multiplier, prompt, seed,
                                         fps_choice, override_profile, override_attention, tiling, use_loras, window_size, window_overlap,
-                                        image_refs_gallery.gallery, phase_2_steps, *state_input, *config_dropdowns, *reference_videos, *refmod_widgets],
+                                        image_refs_gallery.gallery, phase_2_steps, save_latent, *state_input, *config_dropdowns, *reference_videos, *refmod_widgets],
                 outputs=[status])
     abort.click(fn=cancel, queue=False)

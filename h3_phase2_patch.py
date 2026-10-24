@@ -41,7 +41,7 @@ PATCH_MARKER = "_two_phases_plus_patch"
 NOISE_LEVEL_MIN = 0.01
 # Latent upscaler temporal chunk size forced by the plugin. WanGP splits the latent into chunks of 16 latent frames with
 # only 2 frames of context and no blending, which creates one-frame flashes at the chunk boundaries once phase 2 starts at
-# a low noise level. 1024 latent frames (about 70 s at 24 fps) means a single pass for any H3 video (30 s max).
+# a low noise level. 1024 latent frames (about 70 s at 24 fps) means a single pass for any H3 window (481 frames max per window).
 UPSCALER_TEMPORAL_CHUNK = 1024
 # Fixed intermediate sigmas of WanGP's phase 2 schedule (start, 0.6316, 0.3158, 0)
 PHASE_2_FIXED_SIGMAS = (0.6316, 0.3158)

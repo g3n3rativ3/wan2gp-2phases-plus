@@ -37,7 +37,7 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "2 Phases Plus"
-        self.version = "2.12.0"
+        self.version = "2.14.1"
         self.description = "MiniMax H3 Two Phases: phase 2 Turbo LoRA multiplier, phase 2 prompt, extended noise range, and an H3 Upscaler tab."
         self._ui_built = False
         self._hooks_installed = False
@@ -47,7 +47,7 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
     def setup_ui(self):
         patch.extend_noise_level_range()  # before the UI is built, so the slider starts with the extended range
         self.add_tab(tab_id="h3_upscaler", label="H3 Upscaler", component_constructor=self.create_upscaler_tab)
-        for component_id in ("state", "guidance_phases", "guidance_phases_row", "refresh_form_trigger", "model_choice_target", "switch_threshold", "num_inference_steps2", "resolution"):
+        for component_id in ("state", "guidance_phases", "guidance_phases_row", "refresh_form_trigger", "model_choice_target", "switch_threshold", "num_inference_steps2", "resolution", "custom_sigmas"):
             self.request_component(component_id)
 
     def post_ui_setup(self, components):
@@ -70,11 +70,18 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
         initial_visible = self._controls_visible(initial_state.get("model_type"), guidance_phases.value)
         switch_threshold = components.get("switch_threshold")
         phase_2_steps = components.get("num_inference_steps2")  # WanGP 18+ "Phase 2 Steps" (absent in older versions)
-        steps_inputs = [component for component in (switch_threshold, phase_2_steps) if component is not None]
+        custom_sigmas = components.get("custom_sigmas")  # WanGP 18.8+ "Custom Sigmas" (its phase 2 slot overrides the phase 2 schedule)
+        steps_sources = [("start", switch_threshold), ("steps", phase_2_steps), ("custom", custom_sigmas)]
+        steps_sources = [(key, component) for key, component in steps_sources if component is not None]
+        steps_inputs = [component for _, component in steps_sources]
+
+        def steps_text(*values):
+            named = dict(zip((key for key, _ in steps_sources), values))
+            return patch.phase_2_steps_text(named.get("start"), named.get("steps"), named.get("custom"))
+
         resolution = components.get("resolution")
         initial_resolution_text = patch.phase_1_resolution_text(resolution.value) if resolution is not None else ""
-        initial_steps_text = (patch.phase_2_steps_text(switch_threshold.value, phase_2_steps.value if phase_2_steps is not None else None)
-                              if switch_threshold is not None else "")
+        initial_steps_text = steps_text(*(component.value for component in steps_inputs)) if switch_threshold is not None else ""
 
         def build_controls():
             with gr.Column(visible=initial_visible, elem_id="two_phases_plus_controls") as controls:
@@ -98,7 +105,7 @@ class TwoPhasesPlusPlugin(WAN2GPPlugin):
                                            outputs=[controls], show_progress="hidden")
             if switch_threshold is not None:
                 for component in steps_inputs:
-                    component.change(fn=patch.phase_2_steps_text, inputs=steps_inputs, outputs=[steps_info],
+                    component.change(fn=steps_text, inputs=steps_inputs, outputs=[steps_info],
                                      show_progress="hidden", queue=False)
             if resolution is not None:  # any resolution change (presets, megapixels, model switch, loaded settings), no render needed
                 for component in (resolution, phase_1_scale):

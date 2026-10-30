@@ -30,6 +30,11 @@ DEFAULT_NOISE = 0.6
 DEFAULT_PHASE_2_STEPS = patch.PHASE_2_STEPS_DEFAULT  # WanGP 18+ "Phase 2 Steps" (older WanGP: fixed by the noise level start)
 DEFAULT_MULTIPLIER = 0.5
 DEFAULT_PROMPT = "."
+PHASE_2_MODE_TURBO, PHASE_2_MODE_REGENERATE = "turbo", "regenerate"
+PHASE_2_MODE_CHOICES = [("Turbo (WanGP default phase 2)", PHASE_2_MODE_TURBO), ("Open-H3 Regenerate 2K", PHASE_2_MODE_REGENERATE)]
+# WanGP 18.8+ "H3 Regenerate 2K 2 Phases" preset: refiner LoRA (as an accelerator, phase 2 only) and its three-step phase 2 schedule
+REGENERATE_LORA_URL = "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/loras/open_h3_regenerate_2k_lora.safetensors"
+REGENERATE_SIGMAS = (0.909375, 0.8571428571428571, 0.6666666666666666)
 FPS = 24  # MiniMax H3 default frame rate
 FPS_CHOICES = [(f"Model Default ({FPS} fps)", ""), ("Source Video fps", "source")] + [(value, value) for value in ("15", "16", "23", "24", "25", "30", "48", "50")]
 FRAMES_MIN, FRAMES_STEP, FRAMES_OFFSET = 107, 17, 5  # MiniMax H3: 107 frames minimum, then 5 + 17n
@@ -191,9 +196,18 @@ def _plan_text(path, factor, fps_choice="", window_size=WINDOW_DEFAULT, overlap=
     return "<br>".join(lines)
 
 
+SOUNDTRACK_MARGIN_SECONDS = 3.0  # soundtrack kept beyond the processed duration (see _prepare_files)
+
+
 def _prepare_files(path, frames, fps=FPS):
-    """Copy the source into a work folder and write its soundtrack as a WAV of exactly the processed duration
-    (silence when the video has no audio track)."""
+    """Copy the source into a work folder and write its soundtrack as a WAV covering the processed duration plus a margin
+    (silence where the video has no more audio).
+
+    The margin matters with sliding windows: WanGP's last window can be a few frames longer than the video (H3 window
+    lengths are 5 + 17n frames, at least 107), and H3 also generates a short audio tail after each window. Where the
+    soundtrack does not cover a window, WanGP keeps the audio generated for that window instead of the soundtrack, and in
+    this tab phase 1 is not denoised (it is replaced by the source), so that audio would be pure noise. WanGP trims the
+    final soundtrack to the video duration, so the margin never reaches the output."""
     import numpy as np
     import soundfile as sf
     from shared.utils.audio_video import extract_audio_track_to_wav
@@ -203,7 +217,7 @@ def _prepare_files(path, frames, fps=FPS):
     source_copy = os.path.join(WORK_DIR, f"{stamp}_source{os.path.splitext(path)[1] or '.mp4'}")
     shutil.copyfile(path, source_copy)
     wav_path = os.path.join(WORK_DIR, f"{stamp}_soundtrack.wav")
-    duration = frames / fps
+    duration = frames / fps + SOUNDTRACK_MARGIN_SECONDS
     samples, sample_rate = None, 32000
     try:
         if extract_audio_track_to_wav(source_copy, wav_path):
@@ -381,6 +395,37 @@ def _latent_save_problem(ref2va, tiling, frames, window_size):
     return None
 
 
+def _regenerate_supported():
+    """WanGP 18.8+: Custom Sigmas and the Open-H3 Regenerate phase 2 (silent phase 2 audio, phase 1 audio kept)."""
+    wgp = _wgp()
+    if wgp is None or not callable(getattr(wgp, "parse_custom_sigmas", None)):
+        return False
+    try:
+        from models.minimax_h3 import constants
+    except Exception:
+        return False
+    return bool(getattr(constants, "H3_REGENERATE_LORA", None))
+
+
+def _regenerate_loras(loras, loras_multipliers):
+    """The Regenerate LoRA as the only accelerator (phase 2 only), followed by the additional LoRAs of Media Generator,
+    as WanGP's preset does (accelerator LoRAs, the part before '|', are replaced)."""
+    loras, loras_multipliers = list(loras or []), loras_multipliers or ""
+    try:
+        from shared.utils.loras_mutipliers import extract_loras_side
+        loras, loras_multipliers = extract_loras_side(loras, loras_multipliers, "after")
+    except Exception:
+        pass
+    return [REGENERATE_LORA_URL] + loras, "0;1|" + (loras_multipliers or "").strip()
+
+
+def _phase_2_info(mode, noise_value, steps_value):
+    if mode == PHASE_2_MODE_REGENERATE:
+        return (f"**Phase 2: {len(REGENERATE_SIGMAS)} steps** (Open-H3 Regenerate 2K: sigmas {', '.join(f'{value:.4g}' for value in REGENERATE_SIGMAS)}, 0). "
+                "Refiner LoRA instead of the Turbo LoRA, made for high-resolution detail; the soundtrack is kept.")
+    return patch.phase_2_steps_text(noise_value, steps_value)
+
+
 def _component_tree(block):
     for child in getattr(block, "children", None) or []:
         yield child
@@ -504,7 +549,7 @@ def _read_prompt(path):
 def build_settings(source_copy, wav_path, plan, factor, model_type, noise_level, multiplier, prompt, seed,
                    config="", override_profile=-1, override_attention="", tiling=False, loras=None, loras_multipliers="",
                    window_size=WINDOW_DEFAULT, overlap=OVERLAP_DEFAULT, ref2va=False, image_refs=None, reference_videos=None,
-                   refmods=None, phase_2_steps=None):
+                   refmods=None, phase_2_steps=None, phase_2_mode=PHASE_2_MODE_TURBO):
     frames = plan["frames"]
     image_refs = list(image_refs or [])
     reference_videos = list(reference_videos or [])[:REFERENCE_VIDEO_SLOTS]
@@ -552,6 +597,14 @@ def build_settings(source_copy, wav_path, plan, factor, model_type, noise_level,
     }
     if phase_2_steps is not None:
         settings["num_inference_steps2"] = int(phase_2_steps)
+    wgp = _wgp()
+    if wgp is not None and callable(getattr(wgp, "parse_custom_sigmas", None)):
+        settings["custom_sigmas"] = ""  # WanGP 18.8+: the tab's own phase 2 schedule (Noise Level Start and Phase 2 Steps)
+    if phase_2_mode == PHASE_2_MODE_REGENERATE:
+        regenerate_loras, regenerate_multipliers = _regenerate_loras(settings["activated_loras"], settings["loras_multipliers"])
+        settings.update({"activated_loras": regenerate_loras, "loras_multipliers": regenerate_multipliers,
+                         "custom_sigmas": "; " + ", ".join(repr(value) for value in REGENERATE_SIGMAS),
+                         "switch_threshold": REGENERATE_SIGMAS[0], "num_inference_steps2": len(REGENERATE_SIGMAS)})
     if ref2va:
         settings.update({"image_refs": image_refs or None, "image_refs_relative_size": 100, "remove_background_images_ref": 0})
         for index, key in enumerate(("video_guide", "video_guide2", "video_guide3")):
@@ -595,13 +648,19 @@ def create_tab(plugin, api_session):
                     image_refs_gallery.mount()
                 reference_videos = [gr.Video(label=f"Reference Video {index + 1}", sources=["upload"], height=REFERENCE_HEIGHT, min_width=160)
                                     for index in range(REFERENCE_VIDEO_SLOTS)]
-        noise_level = gr.Slider(minimum=patch.NOISE_LEVEL_MIN, maximum=1.0, step=0.01, value=DEFAULT_NOISE,
-                                label=patch.noise_level_label(), show_reset_button=False)
-        phase_2_steps = gr.Slider(minimum=1, maximum=10, step=1, value=DEFAULT_PHASE_2_STEPS, label="Phase 2 Steps",
-                                  visible=patch.phase_2_steps_supported(), show_reset_button=False)
+        regenerate_supported = _regenerate_supported()
+        phase_2_mode = gr.Radio(choices=PHASE_2_MODE_CHOICES, value=PHASE_2_MODE_TURBO, label="Phase 2 Mode", visible=regenerate_supported,
+                                info="Open-H3 Regenerate 2K (WanGP 18.8+): a refiner LoRA with its own three-step schedule, for finer detail at "
+                                     "high resolution. It replaces the Turbo LoRA, the noise level and the steps below; the soundtrack is kept.")
+        with gr.Column() as turbo_controls:
+            noise_level = gr.Slider(minimum=patch.NOISE_LEVEL_MIN, maximum=1.0, step=0.01, value=DEFAULT_NOISE,
+                                    label=patch.noise_level_label(), show_reset_button=False)
+            phase_2_steps = gr.Slider(minimum=1, maximum=10, step=1, value=DEFAULT_PHASE_2_STEPS, label="Phase 2 Steps",
+                                      visible=patch.phase_2_steps_supported(), show_reset_button=False)
         steps_info = gr.Markdown(patch.phase_2_steps_text(DEFAULT_NOISE, DEFAULT_PHASE_2_STEPS))
-        multiplier = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, value=DEFAULT_MULTIPLIER,
-                               label="Phase 2 Turbo LoRA Multiplier", show_reset_button=False)
+        with gr.Column() as multiplier_controls:
+            multiplier = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, value=DEFAULT_MULTIPLIER,
+                                   label="Phase 2 Turbo LoRA Multiplier", show_reset_button=False)
         prompt = gr.Textbox(value=DEFAULT_PROMPT, lines=3, max_lines=12, label="Phase 2 Prompt",
                             placeholder="'.' = no description, phase 2 only refines what it sees.")
         with gr.Row():
@@ -656,7 +715,7 @@ def create_tab(plugin, api_session):
 
     def run_upscale(video_path, factor_value, model_type, noise_value, multiplier_value, prompt_value, seed_value,
                     fps_value, profile_value, attention_value, tiling_value, use_loras_value, window_value, overlap_value,
-                    image_refs_value, phase_2_steps_value, save_latent_value, state_value, *rest):
+                    image_refs_value, phase_2_steps_value, save_latent_value, phase_2_mode_value, state_value, *rest):
         # A generator, run directly by WanGP's WebUI session wrapper (it keeps the Gradio session needed to queue the task).
         config_values = rest[:CONFIG_SLOTS]
         reference_video_values = rest[CONFIG_SLOTS:CONFIG_SLOTS + REFERENCE_VIDEO_SLOTS]
@@ -690,7 +749,8 @@ def create_tab(plugin, api_session):
                                   config=config, override_profile=profile_value, override_attention=attention_value, tiling=bool(tiling_value),
                                   loras=loras, loras_multipliers=loras_multipliers, window_size=window_value, overlap=overlap_value,
                                   ref2va=ref2va, image_refs=image_refs, reference_videos=videos, refmods=refmods,
-                                  phase_2_steps=phase_2_steps_value if patch.phase_2_steps_supported() else None)
+                                  phase_2_steps=phase_2_steps_value if patch.phase_2_steps_supported() else None,
+                                  phase_2_mode=phase_2_mode_value if regenerate_supported else PHASE_2_MODE_TURBO)
         if save_latent_value:
             if ref2va:
                 _allow_upscale_soundtrack(latent_module)
@@ -703,7 +763,8 @@ def create_tab(plugin, api_session):
               f"model {model_type}{', tiled phase 2' if tiling_value else ''}{', config ' + config if config else ''}"
               f", sliding window {int(window_value)}/{int(overlap_value)}{', LoRAs ' + str(len(loras)) if loras else ''}"
               + (f", {len(image_refs)} reference image(s), {len(videos)} reference video(s){', RefMods' if refmods else ''}" if ref2va else "")
-              + (", latent checkpoint saved (H3 Latent Continue)" if save_latent_value else ""))
+              + (", latent checkpoint saved (H3 Latent Continue)" if save_latent_value else "")
+              + (", phase 2 Open-H3 Regenerate 2K" if regenerate_supported and phase_2_mode_value == PHASE_2_MODE_REGENERATE else ""))
 
         progress_state = {"text": "Queued in WanGP...", "changed": True}
 
@@ -757,8 +818,10 @@ def create_tab(plugin, api_session):
     plan_inputs = [source_video, factor, fps_choice, window_size, window_overlap]
     for component in plan_inputs:
         component.change(fn=_plan_text, inputs=plan_inputs, outputs=[plan_info], show_progress="hidden")
-    for component in (noise_level, phase_2_steps):
-        component.change(fn=patch.phase_2_steps_text, inputs=[noise_level, phase_2_steps], outputs=[steps_info], show_progress="hidden", queue=False)
+    for component in (noise_level, phase_2_steps, phase_2_mode):
+        component.change(fn=_phase_2_info, inputs=[phase_2_mode, noise_level, phase_2_steps], outputs=[steps_info], show_progress="hidden", queue=False)
+    phase_2_mode.change(fn=lambda mode: [gr.update(visible=mode != PHASE_2_MODE_REGENERATE)] * 2, inputs=[phase_2_mode],
+                        outputs=[turbo_controls, multiplier_controls], show_progress="hidden", queue=False)
     model.change(fn=model_changed, inputs=[model], show_progress="hidden",
                  outputs=[*config_dropdowns, override_attention, references] + ([refmods_section] if refmods_section is not None else []))
     for trigger in (model.change, refresh_loras.click, use_loras.change):
@@ -770,6 +833,6 @@ def create_tab(plugin, api_session):
     copy_prompt.click(fn=_read_prompt, inputs=[source_video], outputs=[prompt])
     start.click(fn=run_upscale, inputs=[source_video, factor, model, noise_level, multiplier, prompt, seed,
                                         fps_choice, override_profile, override_attention, tiling, use_loras, window_size, window_overlap,
-                                        image_refs_gallery.gallery, phase_2_steps, save_latent, *state_input, *config_dropdowns, *reference_videos, *refmod_widgets],
+                                        image_refs_gallery.gallery, phase_2_steps, save_latent, phase_2_mode, *state_input, *config_dropdowns, *reference_videos, *refmod_widgets],
                 outputs=[status])
     abort.click(fn=cancel, queue=False)

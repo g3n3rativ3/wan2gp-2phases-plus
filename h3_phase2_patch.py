@@ -97,6 +97,31 @@ def parse_prompt(value):
     return value.strip() if isinstance(value, str) else ""
 
 
+REGENERATE_LORA_TOKEN = "regenerate"  # open_h3_regenerate_2k_lora.safetensors (WanGP 18.8+ "H3 Regenerate 2K 2 Phases" preset)
+
+
+def _phase_value(value):
+    """A LoRA's phase 2 multiplier as one number (a per-step list counts only when all its values are equal), or None."""
+    if isinstance(value, (list, tuple)):
+        values = {float(item) for item in value}
+        return values.pop() if len(values) == 1 else None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_h3_turbo_name(name, is_required_turbo=None):
+    lower = str(name).lower()
+    if is_required_turbo is not None:
+        try:
+            if is_required_turbo(lower):
+                return True
+        except Exception:
+            pass
+    return "minimax_h3" in lower and "turbo" in lower and "vdn" not in lower
+
+
 def _lora_name(lora):
     return os.path.basename(str(lora).split("|", 1)[0])
 
@@ -136,7 +161,11 @@ def _make_generate(original_generate):
             print(f"{LOG_PREFIX} values {'from the task settings' if from_task else 'from the UI controls'}: "
                   f"phase 1 at output / {phase_1_scale:g}, phase 2 Turbo LoRA multiplier {multiplier:g}, phase 2 prompt {'set (' + str(len(phase2_prompt)) + ' characters)' if phase2_prompt else 'empty'}")
         schedule_override = None
-        if two_phase:
+        custom_schedule = custom_phase_2_sigmas(kwargs.get("custom_sigmas")) if two_phase else None
+        if custom_schedule is not None:  # WanGP 18.8+ Custom Sigmas (e.g. the H3 Regenerate 2K preset): WanGP uses them as they are
+            print(f"{LOG_PREFIX} phase 2 sigmas from Custom Sigmas: {', '.join(f'{value:.4g}' for value in custom_schedule)} "
+                  f"({len(custom_schedule) - 1} step(s)); Phase 2 Noise Level Start and Phase 2 Steps are not used")
+        elif two_phase:
             schedule_override = _phase_2_schedule_for(kwargs.get("switch_threshold"), kwargs.get("sampling_steps2"))
         previous = _current()
         _state.run = {
@@ -197,23 +226,49 @@ def _make_update_loras_slists(original_update_loras_slists, is_required_turbo):
                 print(f"{LOG_PREFIX} WARNING H3 Upscaler: the source video did not replace phase 1 (the transformer call was not intercepted); the result will not follow the source")
             multiplier = run["multiplier"]
             if multiplier != WANGP_MULTIPLIER:
-                turbo_index = None
-                phase_2_loras = getattr(run.get("pipeline"), "_phase_2_loras", None)
+                turbo_index, replaced = None, False
+                phase_2_values = slists_dict.get("phase2", ())
+                pipeline = run.get("pipeline")
+                phase_2_loras = getattr(pipeline, "_phase_2_loras", None)
                 if isinstance(phase_2_loras, (tuple, list)) and phase_2_loras:
-                    # WanGP 18+: the automatic Turbo LoRA is the first LoRA after the model's own; WanGP sets its phase 2 multiplier
-                    # to 0 when accelerator LoRAs given before "|" replace it, and to 1 otherwise
-                    turbo_index = int(phase_2_loras[0])
-                    phase_2_values = slists_dict.get("phase2", ())
-                    current = phase_2_values[turbo_index] if turbo_index < len(phase_2_values) else None
-                    if current is not None and not isinstance(current, list) and float(current) == 0.0:
-                        print(f"{LOG_PREFIX} phase 2: the automatic Turbo LoRA is replaced by your accelerator LoRAs, multiplier {multiplier:g} not applied")
-                        turbo_index = -1
+                    # WanGP 18+: the automatic Turbo LoRA is the first LoRA after the model's own; WanGP 18.0x sets its phase 2
+                    # multiplier to 0 when accelerator LoRAs given before "|" replace it (WanGP 18.8+ does not add it at all then)
+                    index = int(phase_2_loras[0])
+                    current = _phase_value(phase_2_values[index]) if index < len(phase_2_values) else None
+                    if current == 0.0:
+                        replaced = True
+                    elif current is not None:
+                        turbo_index = index
                 elif is_required_turbo is not None:  # older WanGP: the automatic Turbo LoRA is found by its file name
                     turbo_index = next((index for index, lora in enumerate(run["loras_selected"]) if is_required_turbo(_lora_name(lora))), None)
+                if turbo_index is None:
+                    # an H3 Turbo LoRA selected as an accelerator, as the "H3 Original 2 Phases" preset of WanGP 18.8+ does ("0;1" before "|")
+                    for index, lora in enumerate(run["loras_selected"]):
+                        if index < len(phase_2_values) and _is_h3_turbo_name(_lora_name(lora), is_required_turbo):
+                            value = _phase_value(phase_2_values[index])
+                            if value == 1.0:
+                                turbo_index = index
+                                break
+                            if value:
+                                print(f"{LOG_PREFIX} phase 2: Turbo LoRA '{_lora_name(lora)}' keeps the phase 2 multiplier you set ({value:g}); "
+                                      f"Phase 2 Turbo LoRA Multiplier {multiplier:g} not applied")
+                                turbo_index = -1
+                                break
+                regenerate = next((_lora_name(lora) for index, lora in enumerate(run["loras_selected"])
+                                   if REGENERATE_LORA_TOKEN in _lora_name(lora).lower() and index < len(phase_2_values)
+                                   and _phase_value(phase_2_values[index]) not in (None, 0.0)), None)
                 if turbo_index == -1:
                     pass
-                elif turbo_index is None or turbo_index >= len(slists_dict.get("phase2", ())):
-                    print(f"{LOG_PREFIX} phase 2: no built-in Turbo LoRA found, multiplier {multiplier:g} not applied")
+                elif turbo_index is None or turbo_index >= len(phase_2_values):
+                    if regenerate:
+                        reason = f"the '{regenerate}' LoRA is used instead of a Turbo LoRA (H3 Regenerate)"
+                    elif getattr(getattr(pipeline, "transformer", None), "pdd_num_steps", None) is not None:
+                        reason = "PDD model: phase 2 uses no Turbo LoRA"
+                    elif replaced or hasattr(pipeline, "_phase_2_loras"):
+                        reason = "no Turbo LoRA in phase 2 (replaced by your accelerator LoRAs, or not used by this model)"
+                    else:
+                        reason = "no built-in Turbo LoRA found"
+                    print(f"{LOG_PREFIX} phase 2: {reason}, multiplier {multiplier:g} not applied")
                 else:
                     slists_dict = dict(slists_dict)
                     slists_dict["phase2"] = list(slists_dict["phase2"])
@@ -429,7 +484,32 @@ def phase_2_schedule(start, steps=None):
     return (start, *[value for value in fixed if value < start], 0.0)
 
 
-def phase_2_steps_text(start, steps=None):
+def custom_phase_2_sigmas(value):
+    """Phase 2 schedule set in WanGP's "Custom Sigmas" (WanGP 18.8+: one slot per phase, separated by ';'), with its
+    terminal 0, or None when phase 2 uses its normal schedule (empty field or blank phase 2 slot)."""
+    if isinstance(value, (list, tuple)):  # already parsed by WanGP: one entry per phase
+        slot = value[1] if len(value) > 1 else None
+        return [float(sigma) for sigma in slot] + [0.0] if slot else None
+    if not isinstance(value, str) or ";" not in value:
+        return None
+    slots = value.split(";")
+    if len(slots) < 2 or not slots[1].strip():
+        return None
+    try:
+        sigmas = [float(token.strip()) for token in slots[1].split(",") if token.strip()]
+    except ValueError:
+        return None
+    if sigmas and sigmas[-1] == 0:
+        sigmas.pop()
+    return sigmas + [0.0] if sigmas else None
+
+
+def phase_2_steps_text(start, steps=None, custom_sigmas=None):
+    custom = custom_phase_2_sigmas(custom_sigmas)
+    if custom is not None:
+        count = len(custom) - 1
+        return (f"**Phase 2: {count} step{'s' if count > 1 else ''}** (Custom Sigmas: {', '.join(f'{value:.4g}' for value in custom)}). "
+                "Phase 2 Noise Level Start and Phase 2 Steps are ignored while Custom Sigmas sets phase 2.")
     schedule = phase_2_schedule(start, steps)
     if schedule is None:
         return ""
